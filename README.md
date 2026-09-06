@@ -1,5 +1,18 @@
 # Lilith
 
+## Ethical Use & Disclaimer
+
+Lilith is intended exclusively for security research, education, and authorized security assessments.
+
+Only use Lilith against systems you own or systems for which you have explicit permission to perform security testing. Do not use the framework to gain unauthorized access, disrupt services, damage systems, or test third-party infrastructure without authorization.
+
+The project and its examples are provided for legitimate security testing and educational purposes. Users are responsible for ensuring that their use of Lilith complies with applicable laws, organizational policies, and authorization requirements.
+
+The author assumes no responsibility for misuse of the software or for actions performed outside an explicitly authorized testing scope.
+
+Lilith is intended to support security awareness, vulnerability research, and secure software development.
+
+
 **Web Security Assessment Framework**
 
 Lilith is an open-source web security assessment framework designed for authorized security testing, research, and education. It focuses on evidence-aware findings, confidence-aware reporting, false-positive reduction, and clear OWASP/CWE/MITRE classification.
