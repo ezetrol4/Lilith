@@ -1,0 +1,89 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="{% static 'css/lilith.css' %}">
+  <title>Lilith — Web Security Assessment Framework</title>
+</head>
+<body>
+
+  <main class="landing">
+    <div class="landing__card">
+      <div class="landing__heading">
+        <h1 class="landing__title">LILITH</h1>
+        <p class="landing__subtitle">Web Security Assessment Framework</p>
+      </div>
+
+      <form class="landing__form" id="targetForm" autocomplete="off">
+        <div>
+          <label class="landing__label" for="urlInput">Target</label>
+          <input
+            id="urlInput"
+            name="url"
+            type="text"
+            class="input-target"
+            placeholder="https://example.com"
+            spellcheck="false"
+            autocapitalize="off"
+          >
+        </div>
+
+        <div class="landing__error" id="targetError"></div>
+
+        <button id="userMe" type="submit" class="btn btn-primary landing__cta">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label-idle">Run Assessment</span>
+          <span class="btn-label-loading" style="display:none">Starting assessment...</span>
+        </button>
+      </form>
+
+      <p class="landing__note">
+        Only scan systems you own or are explicitly authorized to test.
+      </p>
+    </div>
+  </main>
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+  <script>
+    $(function () {
+      var $form    = $('#targetForm');
+      var $input   = $('#urlInput');
+      var $error   = $('#targetError');
+      var $button  = $('#userMe');
+
+      function showError(message) {
+        $error.text(message).addClass('is-visible');
+      }
+
+      function clearError() {
+        $error.text('').removeClass('is-visible');
+      }
+
+      $input.on('input', clearError);
+
+      $form.on('submit', function (e) {
+        e.preventDefault();
+        var value = $input.val().trim();
+
+        if (!value) {
+          showError('Enter a target URL to begin.');
+          $input.trigger('focus');
+          return;
+        }
+
+        clearError();
+        $button.prop('disabled', true).addClass('is-loading');
+        $button.find('.btn-label-idle').hide();
+        $button.find('.btn-label-loading').show();
+
+        window.location.href = '/Ana/?url=' + encodeURIComponent(value);
+      });
+    });
+  </script>
+
+  {% block content %}{% endblock %}
+</body>
+</html>

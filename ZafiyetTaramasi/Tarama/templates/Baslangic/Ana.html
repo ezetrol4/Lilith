@@ -1,0 +1,977 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="{% static 'css/lilith.css' %}">
+  <title>Lilith — Assessment Dashboard</title>
+</head>
+<body>
+
+  <header class="dash__topbar">
+    <div class="lilith-brand">
+      <a href="/index" style="text-decoration:none">
+        <span class="lilith-brand__name">LILITH</span>
+      </a>
+      <span class="lilith-brand__version">v1.0</span>
+    </div>
+    <div class="dash__target">
+      <span id="topbarTarget" class="dash__target-url">—</span>
+      <span id="scanStatusTag" class="status-tag" data-state="PENDING">Pending</span>
+    </div>
+  </header>
+
+  <div class="dash">
+    <nav class="dash__sidebar" id="sidebarNav">
+      <button class="nav-item is-active" data-section="overview">Overview</button>
+      <button class="nav-item" data-section="findings">Findings</button>
+
+      <div class="nav-group-label">Assessment</div>
+      <button class="nav-item" data-section="web-application">Web Application</button>
+      <button class="nav-item" data-section="network">Network</button>
+      <button class="nav-item" data-section="tls-dns">TLS &amp; DNS</button>
+
+      <div class="nav-group-label">Frameworks</div>
+      <button class="nav-item" data-section="frameworks">CMS &amp; Technology</button>
+    </nav>
+
+    <main class="dash__main">
+
+      <!-- ================= OVERVIEW ================= -->
+      <section class="dash-section" id="section-overview">
+        <h2 class="section-title">Overview</h2>
+
+        <div id="overviewEmpty" class="state-block">
+          <span class="spinner"></span>
+          <span id="overviewEmptyText">Scanning target...</span>
+        </div>
+
+        <div id="overviewError" class="alert alert-error" style="display:none; margin-bottom: var(--sp-6)">
+          <div class="alert__title">Assessment failed</div>
+          <div class="alert__body" id="overviewErrorBody"></div>
+        </div>
+
+        <div id="overviewContent" style="display:none">
+
+          <div class="metrics-strip">
+            <span class="metric-item"><span class="metric-item__label">Confirmed</span>&nbsp;<span class="metric-item__value" id="metricConfirmed">0</span></span>
+            <span class="metric-item"><span class="metric-item__label">Potential</span>&nbsp;<span class="metric-item__value" id="metricPotential">0</span></span>
+            <span class="metric-item"><span class="metric-item__label">Review</span>&nbsp;<span class="metric-item__value" id="metricManualReview">0</span></span>
+          </div>
+          <div class="metrics-strip">
+            <span class="metric-item metric-item--critical"><span class="metric-item__dot"></span><span class="metric-item__label">Critical</span>&nbsp;<span class="metric-item__value" id="metricCritical">0</span></span>
+            <span class="metric-item metric-item--high"><span class="metric-item__dot"></span><span class="metric-item__label">High</span>&nbsp;<span class="metric-item__value" id="metricHigh">0</span></span>
+            <span class="metric-item metric-item--medium"><span class="metric-item__dot"></span><span class="metric-item__label">Medium</span>&nbsp;<span class="metric-item__value" id="metricMedium">0</span></span>
+            <span class="metric-item metric-item--low"><span class="metric-item__dot"></span><span class="metric-item__label">Low</span>&nbsp;<span class="metric-item__value" id="metricLow">0</span></span>
+          </div>
+
+          <div class="result-block" style="margin-top:var(--sp-6)">
+            <div class="result-block__head"><span class="result-block__title">Priority Findings</span></div>
+            <div class="table-wrap">
+              <table class="lilith-table" id="priorityFindingsTable">
+                <thead><tr><th style="width:70px">Severity</th><th>Finding</th><th style="width:110px">Status</th><th>Location</th></tr></thead>
+                <tbody id="priority-findings-tbody"></tbody>
+              </table>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ================= FINDINGS ================= -->
+      <section class="dash-section" id="section-findings" hidden>
+        <h2 class="section-title">Findings</h2>
+
+        <div class="findings-toolbar">
+          <input type="text" id="findingsSearch" class="findings-search" placeholder="Search findings, URL, CWE...">
+
+          <div class="quick-filters" id="quickFilters">
+            <button class="qf-btn is-active" data-quick="all" type="button">All</button>
+            <button class="qf-btn" data-quick="CONFIRMED" type="button">Confirmed</button>
+            <button class="qf-btn" data-quick="POTENTIAL" type="button">Potential</button>
+            <button class="qf-btn" data-quick="MANUAL_REVIEW" type="button">Review</button>
+          </div>
+
+          <select id="filterSeverity" class="findings-select" title="Severity represents potential security impact.">
+            <option value="">Severity: All</option>
+            <option value="CRITICAL">Critical</option>
+            <option value="HIGH">High</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="LOW">Low</option>
+            <option value="INFO">Info</option>
+          </select>
+
+          <select id="filterConfidence" class="findings-select" title="Confidence represents how strongly the available evidence supports the finding.">
+            <option value="">Confidence: All</option>
+            <option value="HIGH">High</option>
+            <option value="MEDIUM">Medium</option>
+            <option value="LOW">Low</option>
+          </select>
+
+          <select id="filterModule" class="findings-select">
+            <option value="">Module: All</option>
+          </select>
+
+          <label class="findings-toggle">
+            <input type="checkbox" id="includeInfoSecure"> Include info/secure
+          </label>
+
+          <button class="clear-filters-btn" id="clearFiltersBtn" type="button" style="display:none">Clear filters</button>
+
+          <span class="findings-count" id="findingsVisibleCount"></span>
+        </div>
+
+        <div class="findings-layout">
+          <div class="findings-table-wrap table-wrap">
+            <table class="lilith-table">
+              <thead><tr>
+                <th style="width:70px" title="Severity represents potential security impact.">Severity</th>
+                <th style="width:110px">Status</th>
+                <th style="width:70px" title="Confidence represents how strongly the available evidence supports the finding.">Confidence</th>
+                <th>Finding</th>
+                <th>Location</th>
+                <th style="width:120px">Module</th>
+              </tr></thead>
+              <tbody id="all-findings-tbody"></tbody>
+            </table>
+          </div>
+          <aside class="finding-detail" id="findingDetail">
+            <div class="state-block" id="findingDetailEmpty">Select a finding to view details.</div>
+            <div id="findingDetailContent" style="display:none">
+              <div class="fd-title" id="fdTitle"></div>
+              <div class="fd-badges">
+                <span class="badge" id="fdSeverityBadge"></span>
+                <span class="status-chip" id="fdStatusChip"></span>
+              </div>
+              <div class="fd-confidence" id="fdConfidenceRow">Confidence: <span id="fdConfidenceValue"></span></div>
+
+              <div class="fd-section" id="fdLocationSection">
+                <div class="fd-label">Affected Location</div>
+                <div class="fd-mono" id="fdLocation"></div>
+                <div class="fd-kv" id="fdParameterRow"><span class="fd-label-inline">Parameter</span><span class="fd-mono" id="fdParameter"></span></div>
+              </div>
+
+              <div class="fd-section" id="fdDescriptionSection">
+                <div class="fd-label">Description</div>
+                <div class="fd-value" id="fdDescription"></div>
+              </div>
+
+              <div class="fd-section" id="fdEvidenceSection">
+                <div class="fd-label">Evidence</div>
+                <pre class="evidence-block" id="fdEvidence"></pre>
+                <button class="evidence-toggle" id="fdEvidenceToggle" type="button" style="display:none">Show more</button>
+              </div>
+
+              <div class="fd-section" id="fdClassificationSection">
+                <div class="fd-label">Classification</div>
+                <table class="classification-table">
+                  <tbody>
+                    <tr id="fdOwaspRow"><td>OWASP</td><td id="fdOwasp"></td></tr>
+                    <tr id="fdCweRow"><td>CWE</td><td id="fdCwe"></td></tr>
+                    <tr id="fdMitreRow"><td>MITRE ATT&amp;CK</td><td id="fdMitre"></td></tr>
+                  </tbody>
+                </table>
+              </div>
+
+              <div class="fd-section" id="fdRecommendationSection">
+                <div class="fd-label">Recommendation</div>
+                <div class="fd-value" id="fdRecommendation"></div>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ================= WEB APPLICATION ================= -->
+      <section class="dash-section" id="section-web-application" hidden>
+        <h2 class="section-title">Web Application</h2>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Security Headers</span></div>
+          <div class="state-block" id="loading-screen-security" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th>Control</th><th>Detail</th></tr></thead>
+            <tbody id="headers-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">SQL Injection</span><span class="result-block__meta" id="header-info"></span></div>
+          <div class="state-block" id="loading-screen-sql-scan" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table" id="sql-scan-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:220px">Type</th><th>Location &amp; Detail</th></tr></thead>
+            <tbody id="sql-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Cross-Site Scripting</span><span class="result-block__meta" id="xss-header-info"></span></div>
+          <div class="state-block" id="loading-screen-xss-scan" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table" id="xss-scan-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:220px">Type</th><th>Location &amp; Detail</th></tr></thead>
+            <tbody id="xss-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">OS Command Injection</span><span class="result-block__meta" id="cmd-header-info"></span></div>
+          <div class="state-block" id="loading-screen-cmd" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table" id="cmd-scan-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:220px">Type</th><th>Location &amp; Detail</th></tr></thead>
+            <tbody id="cmd-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">NoSQL Injection</span><span class="result-block__meta" id="nosql-header-info"></span></div>
+          <div class="state-block" id="loading-screen-nosql" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table" id="nosql-scan-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:220px">Type</th><th>Location &amp; Detail</th></tr></thead>
+            <tbody id="nosql-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Access Control</span></div>
+          <div class="state-block" id="loading-screen-access-control" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th>Finding</th><th>Detail</th></tr></thead>
+            <tbody id="access-control-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Authentication</span></div>
+          <div class="state-block" id="loading-screen-auth" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th>Finding</th><th>Detail</th></tr></thead>
+            <tbody id="auth-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Software Integrity</span></div>
+          <div class="state-block" id="loading-screen-integrity" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th>Finding</th><th>Detail</th></tr></thead>
+            <tbody id="integrity-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Error Disclosure</span></div>
+          <div class="state-block" id="loading-screen-error-disclosure" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th>Finding</th><th>Detail</th></tr></thead>
+            <tbody id="error-disclosure-tbody"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ================= NETWORK ================= -->
+      <section class="dash-section" id="section-network" hidden>
+        <h2 class="section-title">Network</h2>
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">Port Discovery</span></div>
+          <div class="state-block" id="loading-screen-scan" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="kv-row" id="host_name_row" style="display:none">
+            <span>Resolved host</span><span class="kv-row__value" id="host_name">—</span>
+          </div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:90px">State</th><th style="width:150px">Port / Service</th><th>Description</th></tr></thead>
+            <tbody id="ports-tbody"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ================= TLS & DNS ================= -->
+      <section class="dash-section" id="section-tls-dns" hidden>
+        <h2 class="section-title">TLS &amp; DNS</h2>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">TLS / SSL</span></div>
+          <div class="state-block" id="loading-screen-ssl" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:200px">Finding</th><th>Detail</th></tr></thead>
+            <tbody id="ssl-tbody"></tbody>
+          </table></div>
+        </div>
+
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">DNS</span></div>
+          <div class="state-block" id="loading-screen-dns" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:200px">Finding</th><th>Detail</th></tr></thead>
+            <tbody id="dns-tbody"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+      <!-- ================= FRAMEWORKS ================= -->
+      <section class="dash-section" id="section-frameworks" hidden>
+        <h2 class="section-title">Frameworks &amp; Technology</h2>
+        <div class="result-block">
+          <div class="result-block__head"><span class="result-block__title">CMS Detection</span></div>
+          <div class="state-block" id="loading-screen-cms" style="display:none;padding:var(--sp-4)"><span class="spinner"></span></div>
+          <div class="table-wrap"><table class="lilith-table">
+            <thead><tr><th style="width:80px">Severity</th><th style="width:200px">Finding</th><th>Detail</th></tr></thead>
+            <tbody id="cms-tbody"></tbody>
+          </table></div>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+  <script>
+    var targetUrl = "{{ target_url|escapejs }}";
+    if (!targetUrl) { window.location.href = '/index'; }
+
+    // --- helpers ---------------------------------------------------------
+
+    function getCookie(name) {
+      var cookieValue = null;
+      if (document.cookie && document.cookie !== '') {
+        var cookies = document.cookie.split(';');
+        for (var i = 0; i < cookies.length; i++) {
+          var cookie = cookies[i].trim();
+          if (cookie.substring(0, name.length + 1) === (name + '=')) {
+            cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+            break;
+          }
+        }
+      }
+      return cookieValue;
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
+    function groupByScanner(findings) {
+      var groups = {};
+      (findings || []).forEach(function (f) {
+        if (!groups[f.scanner]) groups[f.scanner] = [];
+        groups[f.scanner].push(f);
+      });
+      return groups;
+    }
+
+    var SEVERITY_CLASS = {
+      'CRITICAL': 'badge-critical', 'HIGH': 'badge-high', 'MEDIUM': 'badge-medium',
+      'LOW': 'badge-low', 'INFO': 'badge-info'
+    };
+
+    function severityBadge(severity) {
+      var cls = SEVERITY_CLASS[severity] || 'badge-neutral';
+      return '<span class="badge ' + cls + '">' + escHtml(severity || 'INFO') + '</span>';
+    }
+
+    /* Status is authoritative for finding type — its own visual language,
+       distinct from severity color and never brand turquoise. */
+    function formatStatus(status) {
+      if (!status) return '<span class="status-chip">—</span>';
+      var cls = 'status-chip--' + status.toLowerCase();
+      return '<span class="status-chip ' + cls + '">' + escHtml(status.replace(/_/g, ' ')) + '</span>';
+    }
+
+    /* Confidence is secondary to severity — weight/opacity only, never a
+       severity-like color, so it can never be mistaken for severity. */
+    function formatConfidence(confidence) {
+      if (!confidence) return '<span class="confidence-tag">—</span>';
+      var cls = 'confidence-tag--' + confidence.toLowerCase();
+      return '<span class="confidence-tag ' + cls + '">' + escHtml(confidence) + '</span>';
+    }
+
+    /* SECURE/INFORMATIONAL rows stay visible but must never look louder than
+       an actual vulnerability row. */
+    function findingRowClass(f) {
+      return (f.status === 'SECURE' || f.status === 'INFORMATIONAL') ? 'finding-row--muted' : '';
+    }
+
+    /* Compact empty/failed state shown automatically inside a module's own
+       table — no separate module-status panel, no manual action required. */
+    function emptyStateRow(tbodyId, colspan, text) {
+      $('#' + tbodyId).html(
+        '<tr class="table-empty-row"><td colspan="' + colspan + '">' + escHtml(text || 'No security findings') + '</td></tr>'
+      );
+    }
+
+    function moduleFailed(findings) {
+      return (findings || []).some(function (f) { return f.title === 'Tarama hatası'; });
+    }
+
+    // --- sidebar navigation -----------------------------------------------
+
+    $('#sidebarNav .nav-item').on('click', function () {
+      var target = $(this).data('section');
+      $('#sidebarNav .nav-item').removeClass('is-active');
+      $(this).addClass('is-active');
+      $('.dash-section').attr('hidden', true);
+      $('#section-' + target).attr('hidden', false);
+    });
+
+    // --- top bar / status ---------------------------------------------------
+
+    function setScanState(status) {
+      $('#scanStatusTag').attr('data-state', status).text(
+        status.charAt(0) + status.slice(1).toLowerCase()
+      );
+    }
+
+    $('#topbarTarget').text(targetUrl).attr('title', targetUrl);
+
+    // --- overview -----------------------------------------------------------
+
+    function isRealFinding(f) {
+      return f.title !== 'forms_detected' && f.title !== 'host_name';
+    }
+
+    function renderPriorityFindings(findings) {
+      var rows = (findings || []).filter(isRealFinding).slice(0, 6);
+
+      if (!rows.length) { emptyStateRow('priority-findings-tbody', 4, 'No priority findings.'); return; }
+
+      var tbody = $('#priority-findings-tbody');
+      tbody.empty();
+      rows.forEach(function (f) {
+        var location = f.affected_url || f.parameter || f.scanner || '—';
+        var $row = $(
+          '<tr class="is-clickable ' + findingRowClass(f) + '"><td>' + severityBadge(f.severity) + '</td>'
+          + '<td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + formatStatus(f.status) + '</td>'
+          + '<td><code>' + escHtml(location) + '</code></td></tr>'
+        );
+        $row.on('click', function () { openFindingGlobally(f); });
+        tbody.append($row);
+      });
+    }
+
+    // --- Global Findings view: filter/search state + rendering -------------
+
+    var allFindings = [];
+    var currentVisibleFindings = [];
+    var findingsQuickFilter = 'all';
+
+    function findingSearchHaystack(f) {
+      return [f.title, f.affected_url, f.parameter, f.cwe, f.owasp]
+        .filter(Boolean).join(' ').toLowerCase();
+    }
+
+    function populateModuleFilterOptions() {
+      var seen = {};
+      var $select = $('#filterModule');
+      var current = $select.val();
+      $select.find('option[value!=""]').remove();
+      allFindings.forEach(function (f) {
+        if (!f.scanner || seen[f.scanner]) return;
+        seen[f.scanner] = true;
+        $select.append('<option value="' + escHtml(f.scanner) + '">' + escHtml(f.scanner) + '</option>');
+      });
+      if (current) $select.val(current);
+    }
+
+    function applyFindingFilters() {
+      var q = $('#findingsSearch').val().trim().toLowerCase();
+      var sevFilter = $('#filterSeverity').val();
+      var confFilter = $('#filterConfidence').val();
+      var moduleFilter = $('#filterModule').val();
+      var includeInfo = $('#includeInfoSecure').is(':checked');
+      var quick = findingsQuickFilter;
+
+      var anyActive = !!(q || sevFilter || confFilter || moduleFilter || includeInfo || quick !== 'all');
+      $('#clearFiltersBtn').toggle(anyActive);
+
+      currentVisibleFindings = allFindings.filter(isRealFinding).filter(function (f) {
+        if (!includeInfo && f.severity === 'INFO') return false;
+        if (sevFilter && f.severity !== sevFilter) return false;
+        if (confFilter && f.confidence !== confFilter) return false;
+        if (moduleFilter && f.scanner !== moduleFilter) return false;
+        if (quick !== 'all' && f.status !== quick) return false;
+        if (q && findingSearchHaystack(f).indexOf(q) === -1) return false;
+        return true;
+      });
+
+      renderFindingsTable(currentVisibleFindings);
+      $('#findingsVisibleCount').text(
+        'Showing ' + currentVisibleFindings.length + ' of ' + allFindings.filter(isRealFinding).length
+      );
+    }
+
+    function renderFindingsTable(findings) {
+      var tbody = $('#all-findings-tbody');
+      tbody.empty();
+
+      if (!findings.length) {
+        tbody.html('<tr class="table-empty-row"><td colspan="6">No findings match the current filters.</td></tr>');
+        return;
+      }
+
+      findings.forEach(function (f, idx) {
+        var location = f.affected_url || f.parameter || '—';
+        var $row = $(
+          '<tr class="is-clickable ' + findingRowClass(f) + '" data-idx="' + idx + '">'
+          + '<td>' + severityBadge(f.severity) + '</td>'
+          + '<td>' + formatStatus(f.status) + '</td>'
+          + '<td>' + formatConfidence(f.confidence) + '</td>'
+          + '<td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td><code>' + escHtml(location) + '</code></td>'
+          + '<td>' + escHtml(f.scanner || '') + '</td></tr>'
+        );
+        $row.on('click', function () { setSelectedFinding(idx); });
+        tbody.append($row);
+      });
+    }
+
+    // --- Finding detail panel ------------------------------------------------
+
+    function setFdSection(sectionId, hasValue) {
+      $('#' + sectionId).toggle(!!hasValue);
+    }
+
+    function renderFindingDetail(finding) {
+      $('#findingDetailEmpty').hide();
+      $('#findingDetailContent').show();
+
+      $('#fdTitle').text(finding.title || '');
+      $('#fdSeverityBadge').attr('class', 'badge ' + (SEVERITY_CLASS[finding.severity] || 'badge-neutral')).text(finding.severity || 'INFO');
+      $('#fdStatusChip').attr('class', 'status-chip' + (finding.status ? ' status-chip--' + finding.status.toLowerCase() : ''))
+        .text(finding.status ? finding.status.replace(/_/g, ' ') : '')
+        .toggle(!!finding.status);
+
+      setFdSection('fdConfidenceRow', finding.confidence);
+      $('#fdConfidenceValue').text(finding.confidence || '');
+
+      setFdSection('fdLocationSection', finding.affected_url || finding.parameter);
+      $('#fdLocation').text(finding.affected_url || '').toggle(!!finding.affected_url);
+      setFdSection('fdParameterRow', finding.parameter);
+      $('#fdParameter').text(finding.parameter || '');
+
+      setFdSection('fdDescriptionSection', finding.description);
+      $('#fdDescription').text(finding.description || '');
+
+      var evidence = finding.evidence || '';
+      setFdSection('fdEvidenceSection', evidence);
+      var $evidence = $('#fdEvidence').text(evidence).removeClass('is-expanded');
+      var $toggle = $('#fdEvidenceToggle').hide().text('Show more');
+      if (evidence.length > 320) {
+        $toggle.show();
+        $toggle.off('click').on('click', function () {
+          var expanded = $evidence.toggleClass('is-expanded').hasClass('is-expanded');
+          $toggle.text(expanded ? 'Show less' : 'Show more');
+        });
+      }
+
+      setFdSection('fdClassificationSection', finding.owasp || finding.cwe || finding.mitre);
+      setFdSection('fdOwaspRow', finding.owasp);
+      $('#fdOwasp').text(finding.owasp || '');
+      setFdSection('fdCweRow', finding.cwe);
+      $('#fdCwe').text(finding.cwe || '');
+      setFdSection('fdMitreRow', finding.mitre);
+      $('#fdMitre').text(finding.mitre || '');
+
+      setFdSection('fdRecommendationSection', finding.recommendation);
+      $('#fdRecommendation').text(finding.recommendation || '');
+    }
+
+    function setSelectedFinding(idx) {
+      $('#all-findings-tbody tr').removeClass('is-selected');
+      $('#all-findings-tbody tr[data-idx="' + idx + '"]').addClass('is-selected');
+      renderFindingDetail(currentVisibleFindings[idx]);
+    }
+
+    /* Shared entry point for opening a finding's detail from anywhere in the
+       app (Priority Findings, module tables) — always resolves through the
+       global Findings view so there is exactly one detail renderer. */
+    function openFindingGlobally(finding) {
+      $('#sidebarNav .nav-item').removeClass('is-active');
+      $('#sidebarNav .nav-item[data-section="findings"]').addClass('is-active');
+      $('.dash-section').attr('hidden', true);
+      $('#section-findings').attr('hidden', false);
+
+      // Guarantee visibility regardless of currently active filters.
+      $('#findingsSearch').val('');
+      $('#filterSeverity').val('');
+      $('#filterConfidence').val('');
+      $('#filterModule').val('');
+      $('#includeInfoSecure').prop('checked', true);
+      findingsQuickFilter = 'all';
+      $('#quickFilters .qf-btn').removeClass('is-active');
+      $('#quickFilters .qf-btn[data-quick="all"]').addClass('is-active');
+      applyFindingFilters();
+
+      var idx = currentVisibleFindings.indexOf(finding);
+      if (idx !== -1) setSelectedFinding(idx);
+    }
+
+    // --- Findings toolbar wiring --------------------------------------------
+
+    $('#findingsSearch').on('input', applyFindingFilters);
+    $('#filterSeverity, #filterConfidence, #filterModule').on('change', applyFindingFilters);
+    $('#includeInfoSecure').on('change', applyFindingFilters);
+
+    $('#quickFilters').on('click', '.qf-btn', function () {
+      findingsQuickFilter = $(this).data('quick');
+      $('#quickFilters .qf-btn').removeClass('is-active');
+      $(this).addClass('is-active');
+      applyFindingFilters();
+    });
+
+    $('#clearFiltersBtn').on('click', function () {
+      $('#findingsSearch').val('');
+      $('#filterSeverity').val('');
+      $('#filterConfidence').val('');
+      $('#filterModule').val('');
+      $('#includeInfoSecure').prop('checked', false);
+      findingsQuickFilter = 'all';
+      $('#quickFilters .qf-btn').removeClass('is-active');
+      $('#quickFilters .qf-btn[data-quick="all"]').addClass('is-active');
+      applyFindingFilters();
+    });
+
+    function updateOverview(data) {
+      var summary = data.summary || {};
+      var sev = summary.severity || {};
+      $('#metricConfirmed').text(summary.confirmed || 0);
+      $('#metricPotential').text(summary.potential || 0);
+      $('#metricManualReview').text(summary.manual_review || 0);
+      $('#metricCritical').text(sev.critical || 0);
+      $('#metricHigh').text(sev.high || 0);
+      $('#metricMedium').text(sev.medium || 0);
+      $('#metricLow').text(sev.low || 0);
+    }
+
+    // --- per-scanner renderers (data shape unchanged from backend) ---------
+    // Kept as discrete functions — reused by the full-assessment poll below,
+    // and still valid for the individual sync endpoints if invoked elsewhere
+    // (e.g. tests), even though no UI button triggers them directly anymore.
+
+    /* Appends one clickable finding row to tbody and wires it to the shared
+       global detail panel (CLAUDE.md UI Step 2 §24 — reuse one renderer). */
+    function appendFindingRow(tbody, f, cells) {
+      var $row = $('<tr class="is-clickable ' + findingRowClass(f) + '">' + cells + '</tr>');
+      $row.on('click', function () { openFindingGlobally(f); });
+      tbody.append($row);
+    }
+
+    function renderHeaders(findings) {
+      $('#loading-screen-security').hide();
+      if (!findings.length) { emptyStateRow('headers-tbody', 3); return; }
+      var tbody = $('#headers-tbody');
+      tbody.empty();
+      findings.forEach(function (f) {
+        appendFindingRow(tbody, f, '<td>' + severityBadge(f.severity) + '</td>'
+          + '<td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + escHtml(f.evidence || '—') + '</td>');
+      });
+    }
+
+    function renderPorts(findings) {
+      $('#loading-screen-scan').hide();
+      var tbody = $('#ports-tbody');
+      tbody.empty();
+      if (moduleFailed(findings)) { emptyStateRow('ports-tbody', 3, 'Module unavailable — scan error.'); return; }
+
+      findings.forEach(function (f) {
+        if (f.title === 'host_name') {
+          $('#host_name').text(f.evidence);
+          $('#host_name_row').show();
+          return;
+        }
+        var isOpen = f.evidence && f.evidence.indexOf('ACIK') === 0;
+        var badge = isOpen ? severityBadge(f.severity) : '<span class="badge badge-neutral">CLOSED</span>';
+
+        var desc = '', banner = '';
+        if (isOpen) {
+          var parts = f.evidence.split(' | ');
+          desc = parts[1] || '';
+          banner = parts[2] || '';
+        }
+        var descHtml = desc ? '<span style="color:var(--text-muted)">' + escHtml(desc) + '</span>' : '';
+        if (banner) descHtml += (descHtml ? '<br>' : '') + '<code>' + escHtml(banner) + '</code>';
+
+        appendFindingRow(tbody, f, '<td>' + badge + '</td><td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + (descHtml || '—') + '</td>');
+      });
+    }
+
+    function parseSqlEvidence(evidence) {
+      if (!evidence) return {};
+      var result = {};
+      var hataIdx = evidence.indexOf(' | Hata: ');
+      if (hataIdx !== -1) {
+        result['Hata'] = evidence.substring(hataIdx + 9);
+        evidence = evidence.substring(0, hataIdx);
+      }
+      evidence.split(' | ').forEach(function (part) {
+        var ci = part.indexOf(': ');
+        if (ci !== -1) result[part.substring(0, ci).trim()] = part.substring(ci + 2).trim();
+      });
+      return result;
+    }
+
+    function renderSql(findings) {
+      $('#loading-screen-sql-scan').hide();
+      var formCount = 0;
+      var rows = findings.filter(function (f) {
+        if (f.title === 'forms_detected') { formCount = parseInt(f.evidence) || 0; return false; }
+        return true;
+      });
+      $('#header-info').text(formCount > 0 ? formCount + ' form' + (formCount === 1 ? '' : 's') + ' tested' : '');
+
+      if (!rows.length) { emptyStateRow('sql-tbody', 3); return; }
+
+      var tbody = $('#sql-tbody');
+      tbody.empty();
+      rows.forEach(function (f) {
+        var ev = parseSqlEvidence(f.evidence || '');
+        var detail = '';
+        ['URL', 'Gönderim', 'Kontrol', 'Alan', 'Parametre', 'Tip'].forEach(function (k) {
+          if (ev[k]) detail += '<div><span style="color:var(--text-muted);font-size:11px">' + k + ':</span> <span style="word-break:break-all">' + escHtml(ev[k]) + '</span></div>';
+        });
+        if (ev['Payload']) detail += '<div style="margin-top:4px"><code>' + escHtml(ev['Payload']) + '</code></div>';
+        if (ev['True'] && ev['False']) {
+          detail += '<div><span style="color:var(--text-muted);font-size:11px">True:</span> <code>' + escHtml(ev['True']) + '</code></div>';
+          detail += '<div><span style="color:var(--text-muted);font-size:11px">False:</span> <code>' + escHtml(ev['False']) + '</code></div>';
+        }
+        if (ev['Yanıt farklılığı']) detail += '<div>Response diff: <strong>' + escHtml(ev['Yanıt farklılığı']) + '</strong></div>';
+        if (ev['Gecikme']) detail += '<div>Delay: <strong>' + escHtml(ev['Gecikme']) + '</strong></div>';
+        if (ev['Sütun sayısı']) detail += '<div>Column count: <strong>' + escHtml(ev['Sütun sayısı']) + '</strong></div>';
+        if (ev['Hata']) detail += '<div style="margin-top:4px">DB error:<br><code style="display:block;white-space:pre-wrap">' + escHtml(ev['Hata']) + '</code></div>';
+
+        appendFindingRow(tbody, f, '<td>' + severityBadge(f.severity) + '</td><td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + (detail || escHtml(f.evidence || '')) + '</td>');
+      });
+    }
+
+    function parseXssEvidence(evidence) {
+      if (!evidence) return {};
+      var result = {};
+      var idx = evidence.indexOf(' | Yanıt: ');
+      if (idx !== -1) { result['Yanıt'] = evidence.substring(idx + 10); evidence = evidence.substring(0, idx); }
+      evidence.split(' | ').forEach(function (part) {
+        var ci = part.indexOf(':');
+        if (ci > -1) result[part.substring(0, ci).trim()] = part.substring(ci + 1).trim();
+      });
+      return result;
+    }
+
+    function contextBadge(ctx) {
+      return '<span class="badge badge-neutral">' + escHtml(ctx) + '</span>';
+    }
+
+    function renderXss(findings) {
+      $('#loading-screen-xss-scan').hide();
+      var formCount = 0;
+      var rows = findings.filter(function (f) {
+        if (f.title === 'forms_detected') { formCount = parseInt(f.evidence) || 0; return false; }
+        return true;
+      });
+      $('#xss-header-info').text(formCount > 0 ? formCount + ' form' + (formCount === 1 ? '' : 's') + ' tested' : '');
+
+      if (!rows.length) { emptyStateRow('xss-tbody', 3); return; }
+
+      var tbody = $('#xss-tbody');
+      tbody.empty();
+      rows.forEach(function (f) {
+        var ev = parseXssEvidence(f.evidence || '');
+        var locationHtml = '';
+        ['URL', 'Form', 'Alan', 'Parametre', 'Başlık', 'Görüntüleme'].forEach(function (k) {
+          if (ev[k]) locationHtml += '<div><span style="color:var(--text-muted);font-size:11px">' + escHtml(k) + ':</span> <span style="word-break:break-all">' + escHtml(ev[k]) + '</span></div>';
+        });
+        var ctxHtml = ev['Bağlam'] ? '<div style="margin:4px 0">' + contextBadge(ev['Bağlam']) + '</div>' : '';
+        var payloadHtml = ev['Payload'] ? '<div style="margin:4px 0"><code>' + escHtml(ev['Payload']) + '</code></div>' : '';
+        var snippetHtml = ev['Yanıt'] ? '<div style="margin-top:4px"><code style="display:block;white-space:pre-wrap;word-break:break-all">' + escHtml(ev['Yanıt']) + '</code></div>' : '';
+        var domHtml = '';
+        if (ev['Kaynaklar'] || ev['Havuzlar']) {
+          if (ev['Kaynaklar']) domHtml += '<div>Sources: <code>' + escHtml(ev['Kaynaklar']) + '</code></div>';
+          if (ev['Havuzlar']) domHtml += '<div>Sinks: <code>' + escHtml(ev['Havuzlar']) + '</code></div>';
+        }
+        var detail = locationHtml + ctxHtml + payloadHtml + snippetHtml + domHtml;
+        if (!detail) detail = escHtml(f.evidence || '—');
+
+        appendFindingRow(tbody, f, '<td>' + severityBadge(f.severity) + '</td><td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + detail + '</td>');
+      });
+    }
+
+    function parseCmdEvidence(evidence) {
+      if (!evidence) return {};
+      var result = {};
+      ['Kanıt', 'Hata'].forEach(function (key) {
+        var idx = evidence.indexOf(' | ' + key + ': ');
+        if (idx !== -1) { result[key] = evidence.substring(idx + key.length + 4); evidence = evidence.substring(0, idx); }
+      });
+      evidence.split(' | ').forEach(function (part) {
+        var ci = part.indexOf(': ');
+        if (ci !== -1) result[part.substring(0, ci).trim()] = part.substring(ci + 2).trim();
+      });
+      return result;
+    }
+
+    function renderCmd(findings) {
+      $('#loading-screen-cmd').hide();
+      var formCount = 0;
+      var rows = findings.filter(function (f) {
+        if (f.title === 'forms_detected') { formCount = parseInt(f.evidence) || 0; return false; }
+        return true;
+      });
+      $('#cmd-header-info').text(formCount > 0 ? formCount + ' form' + (formCount === 1 ? '' : 's') + ' scanned' : '');
+
+      if (!rows.length) { emptyStateRow('cmd-tbody', 3); return; }
+
+      var tbody = $('#cmd-tbody');
+      tbody.empty();
+      rows.forEach(function (f) {
+        var ev = parseCmdEvidence(f.evidence || '');
+        var detail = '';
+        ['URL', 'Alan', 'Parametre'].forEach(function (k) {
+          if (ev[k]) detail += '<div><span style="color:var(--text-muted);font-size:11px">' + k + ':</span> ' + escHtml(ev[k]) + '</div>';
+        });
+        if (ev['Payload']) detail += '<div style="margin-top:4px"><code>' + escHtml(ev['Payload']) + '</code></div>';
+        if (ev['Gecikme']) detail += '<div>Delay: <strong>' + escHtml(ev['Gecikme']) + '</strong></div>';
+        var snippetVal = ev['Kanıt'] || ev['Hata'];
+        if (snippetVal) detail += '<div style="margin-top:4px">Evidence:<br><code style="display:block;white-space:pre-wrap">' + escHtml(snippetVal) + '</code></div>';
+
+        appendFindingRow(tbody, f, '<td>' + severityBadge(f.severity) + '</td><td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + (detail || escHtml(f.evidence || '')) + '</td>');
+      });
+    }
+
+    function renderNoSql(findings) {
+      $('#loading-screen-nosql').hide();
+      var formCount = 0;
+      var rows = findings.filter(function (f) {
+        if (f.title === 'forms_detected') { formCount = parseInt(f.evidence) || 0; return false; }
+        return true;
+      });
+      $('#nosql-header-info').text(formCount > 0 ? formCount + ' form' + (formCount === 1 ? '' : 's') + ' scanned' : '');
+
+      if (!rows.length) { emptyStateRow('nosql-tbody', 3); return; }
+
+      var tbody = $('#nosql-tbody');
+      tbody.empty();
+      rows.forEach(function (f) {
+        var ev = parseSqlEvidence(f.evidence || '');
+        var detail = '';
+        ['URL', 'Alan', 'Parametre', 'Tip'].forEach(function (k) {
+          if (ev[k]) detail += '<div><span style="color:var(--text-muted);font-size:11px">' + k + ':</span> ' + escHtml(ev[k]) + '</div>';
+        });
+        if (ev['Operatör']) detail += '<div style="margin-top:4px"><code>' + escHtml(ev['Operatör']) + '</code></div>';
+        ['True/False fark', 'True/Baseline fark', 'Yanıt farkı'].forEach(function (k) {
+          if (ev[k]) detail += '<div>' + k + ': <strong>' + escHtml(ev[k]) + '</strong></div>';
+        });
+        if (ev['Hata']) detail += '<div style="margin-top:4px">DB error:<br><code style="display:block;white-space:pre-wrap">' + escHtml(ev['Hata']) + '</code></div>';
+
+        appendFindingRow(tbody, f, '<td>' + severityBadge(f.severity) + '</td><td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + (detail || escHtml(f.evidence || '')) + '</td>');
+      });
+    }
+
+    function renderGenericTable(tbodyId, loadingId, findings) {
+      $('#' + loadingId).hide();
+      if (!findings.length) { emptyStateRow(tbodyId, 3); return; }
+      var tbody = $('#' + tbodyId);
+      tbody.empty();
+      findings.forEach(function (f) {
+        appendFindingRow(tbody, f, '<td>' + severityBadge(f.severity) + '</td>'
+          + '<td><strong>' + escHtml(f.title) + '</strong></td>'
+          + '<td>' + escHtml(f.evidence || '—') + '</td>');
+      });
+    }
+
+    function renderSsl(findings) { renderGenericTable('ssl-tbody', 'loading-screen-ssl', findings); }
+    function renderDns(findings) { renderGenericTable('dns-tbody', 'loading-screen-dns', findings); }
+    function renderCms(findings) { renderGenericTable('cms-tbody', 'loading-screen-cms', findings); }
+    function renderAuth(findings) { renderGenericTable('auth-tbody', 'loading-screen-auth', findings); }
+    function renderIntegrity(findings) { renderGenericTable('integrity-tbody', 'loading-screen-integrity', findings); }
+    function renderErrorDisclosure(findings) { renderGenericTable('error-disclosure-tbody', 'loading-screen-error-disclosure', findings); }
+    function renderAccessControl(findings) { renderGenericTable('access-control-tbody', 'loading-screen-access-control', findings); }
+
+    function renderAll(data) {
+      var groups = groupByScanner(data.findings);
+      renderHeaders(groups['headers'] || []);
+      renderPorts(groups['ports'] || []);
+      renderSql(groups['sql'] || []);
+      renderXss(groups['xss'] || []);
+      renderCmd(groups['cmd'] || []);
+      renderNoSql(groups['nosql'] || []);
+      renderSsl(groups['ssl'] || []);
+      renderDns(groups['dns'] || []);
+      renderCms(groups['cms'] || []);
+      renderAuth(groups['auth'] || []);
+      renderIntegrity(groups['integrity'] || []);
+      renderErrorDisclosure(groups['error_disclosure'] || []);
+      renderAccessControl(groups['access_control'] || []);
+
+      updateOverview(data);
+      renderPriorityFindings(data.findings);
+
+      allFindings = data.findings || [];
+      populateModuleFilterOptions();
+      applyFindingFilters();
+
+      $('#overviewEmpty').hide();
+      $('#overviewContent').show();
+    }
+
+    // --- polling ---------------------------------------------------------------
+    // Full-assessment workflow only. There is no per-module trigger in the UI —
+    // all module results render automatically once the job reaches DONE.
+
+    function pollScan(jobId) {
+      $.ajax({
+        url: '/api/scan/' + jobId + '/',
+        method: 'GET',
+        dataType: 'json',
+        success: function (data) {
+          setScanState(data.status);
+          if (data.status === 'DONE') {
+            renderAll(data);
+          } else if (data.status === 'FAILED') {
+            $('.state-block .spinner').closest('.state-block').each(function () { $(this).hide(); });
+            $('#overviewEmpty').hide();
+            $('#overviewErrorBody').text(data.error || 'Unable to complete the assessment.');
+            $('#overviewError').show();
+          } else {
+            setTimeout(function () { pollScan(jobId); }, 2000);
+          }
+        },
+        error: function () {
+          setTimeout(function () { pollScan(jobId); }, 3000);
+        }
+      });
+    }
+
+    $(document).ready(function () {
+      var csrftoken = getCookie('csrftoken');
+
+      $.ajax({
+        url: '/api/scan/',
+        method: 'POST',
+        data: { url_param: targetUrl },
+        dataType: 'json',
+        beforeSend: function (xhr) { xhr.setRequestHeader('X-CSRFToken', csrftoken); },
+        success: function (res) {
+          setScanState(res.status);
+          pollScan(res.job_id);
+        },
+        error: function () {
+          $('#overviewEmpty').hide();
+          $('#overviewErrorBody').text('Unable to start the assessment.');
+          $('#overviewError').show();
+        }
+      });
+    });
+  </script>
+
+</body>
+</html>

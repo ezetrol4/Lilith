@@ -1,0 +1,53 @@
+# AI / local development assistant
+CLAUDE.md
+.claude/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+my-env/
+venv/
+env/
+.venv/
+
+# Django / databases
+db.sqlite3
+*.sqlite3
+*.db
+staticfiles/
+
+# Logs / coverage
+*.log
+logs/
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary development files
+scratch_*/
+*.tmp
+*.bak
+*.swp
+# Legacy virtual environments
+myenv/
