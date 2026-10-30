@@ -7,6 +7,7 @@ from .scanners.ports import PortScanner
 from .scanners.sql import SqlInjectionScanner
 from .scanners.xss import XssScanner
 from .scanners.base import summarize_findings
+from .services.evidence_redaction import redact_sensitive_text, redact_sensitive_url
 from .services.ssrf_guard import validate_url, SSRFError
 from .services.scan_runner import start_scan
 from .models import ScanJob
@@ -37,15 +38,25 @@ def index(request):
 
 
 def Ana(request):
-    raw = request.GET.get('url', '').strip()
-    if not raw:
+    """Dashboard — yalnızca scan_id ile açılır.
+
+    Ham hedef URL'si hiçbir zaman tarayıcı URL'sine konmaz (adres çubuğu, geçmiş, istek
+    logları): landing sayfası hedefi /api/scan/ isteğinin GÖVDESİNDE gönderir ve buraya
+    yalnızca scan_id ile gelir. Eski `?url=` gezinmesi kaldırıldı; değeri okunmaz,
+    render edilmez, loglanmaz — istek landing'e yönlendirilir.
+    """
+    scan_id = request.GET.get('scan_id', '')
+    if not (scan_id.isascii() and scan_id.isdigit()):
         return redirect('/index')
-    target_url = _normalize_url(raw)
     try:
-        validate_url(target_url)
-    except SSRFError:
+        job = ScanJob.objects.get(id=int(scan_id))
+    except ScanJob.DoesNotExist:
         return redirect('/index')
-    return render(request, "Baslangic/Ana.html", {"target_url": target_url})
+    return render(request, "Baslangic/Ana.html", {
+        "scan_id": job.id,
+        # Kalıcı (zaten güvenli) hedeften; P0-2 öncesi ham kayıtlar için yeniden redakte edilir
+        "target_display_url": redact_sensitive_url(job.target),
+    })
 
 
 @csrf_protect
@@ -60,8 +71,8 @@ def check_headers(request):
     result = HeaderScanner().scan(url)
 
     return JsonResponse({
-        "url_param": result.target,
-        "error": result.error,
+        "url_param": redact_sensitive_url(result.target),
+        "error": redact_sensitive_text(result.error),
         "findings": [f.to_dict() for f in result.findings],
     })
 
@@ -78,8 +89,8 @@ def scan_test(request):
     result = PortScanner().scan(url)
 
     return JsonResponse({
-        "target": result.target,
-        "error": result.error,
+        "target": redact_sensitive_url(result.target),
+        "error": redact_sensitive_text(result.error),
         "findings": [f.to_dict() for f in result.findings],
     })
 
@@ -103,8 +114,8 @@ def check_sql_scan(request):
     ]
 
     return JsonResponse({
-        "sql_scanurl": result.target,
-        "info_test": f"[+] Detected {forms_count} forms on {result.target}.",
+        "sql_scanurl": redact_sensitive_url(result.target),
+        "info_test": f"[+] Detected {forms_count} forms on {redact_sensitive_url(result.target)}.",
         "sqlscan_report": report,
     })
 
@@ -123,9 +134,9 @@ def check_xss_scan(request):
     forms_count = next((int(f.evidence) for f in result.findings if f.title == "forms_detected"), 0)
 
     return JsonResponse({
-        "xss_scanurl": result.target,
-        "xss_infotest": f"[+] {result.target} adresinde {forms_count} form bulundu.",
-        "error": result.error,
+        "xss_scanurl": redact_sensitive_url(result.target),
+        "xss_infotest": f"[+] {redact_sensitive_url(result.target)} adresinde {forms_count} form bulundu.",
+        "error": redact_sensitive_text(result.error),
         "findings": [
             f.to_dict()
             for f in result.findings
@@ -147,7 +158,7 @@ def create_scan(request):
         return JsonResponse({"error": err}, status=400)
 
     job = start_scan(url)
-    return JsonResponse({"job_id": job.id, "status": job.status, "target": job.target}, status=201)
+    return JsonResponse({"job_id": job.id, "status": job.status, "target": redact_sensitive_url(job.target)}, status=201)
 
 
 def scan_status(request, job_id):
@@ -173,7 +184,7 @@ def scan_status(request, job_id):
 
     return JsonResponse({
         "job_id": job.id,
-        "target": job.target,
+        "target": redact_sensitive_url(job.target),
         "status": job.status,
         "error": job.error,
         "duration_seconds": job.duration_seconds,
@@ -191,7 +202,7 @@ def scan_history(request):
         "scans": [
             {
                 "job_id": j.id,
-                "target": j.target,
+                "target": redact_sensitive_url(j.target),
                 "status": j.status,
                 "duration_seconds": j.duration_seconds,
                 "created_at": j.created_at.isoformat(),

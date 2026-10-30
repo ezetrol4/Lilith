@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -92,6 +93,9 @@ def _is_csrf(name: str) -> bool:
 
 def _extract_snippet(body: str, marker: str, width: int = 120) -> str:
     """marker etrafında width karakter döner."""
+    # Kanıt penceresi kesilmeden ÖNCE tüm gövde redakte edilir (yalnızca kanıt metni;
+    # tespit ham gövde üzerinde yapılır)
+    body = redact_sensitive_text(body)
     idx = body.lower().find(marker.lower())
     if idx == -1:
         return ""

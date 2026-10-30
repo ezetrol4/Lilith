@@ -6,6 +6,7 @@ from difflib import SequenceMatcher
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -181,6 +182,9 @@ def _is_csrf(name: str) -> bool:
 
 def _extract_error_snippet(body: str, width: int = 150) -> str:
     """Hata içeren ilk kalıbın bulunduğu yeri 150 karakter olarak döner."""
+    # Kanıt penceresi kesilmeden ÖNCE tüm gövde redakte edilir (yalnızca kanıt metni;
+    # tespit ham gövde üzerinde yapılır)
+    body = redact_sensitive_text(body)
     body_lower = body.lower()
     for pattern in _ERROR_PATTERNS:
         idx = body_lower.find(pattern)

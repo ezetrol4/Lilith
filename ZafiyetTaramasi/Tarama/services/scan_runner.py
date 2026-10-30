@@ -4,6 +4,7 @@ import threading
 from django.db import connection as db_connection
 from django.utils import timezone
 
+from .evidence_redaction import redact_sensitive_text, redact_sensitive_url
 from .orchestrator import run_full_scan
 from .safe_http import OUTBOUND_BLOCKED_MESSAGE
 from ..models import ScanJob, ScanFinding
@@ -28,17 +29,23 @@ def _save_report(job: ScanJob, report) -> None:
                 scanner=scan_result.scanner,
                 severity='INFO' if blocked else 'MEDIUM',
                 title='Tarama hatası',
-                evidence=scan_result.error,
+                # Hata metni istisna mesajından gelebilir (URL, yanıt parçası)
+                evidence=redact_sensitive_text(scan_result.error),
                 status='INFORMATIONAL' if blocked else '',
             ))
         for finding in scan_result.findings:
+            # Kalıcılık sınırında defense-in-depth: Finding oluşturulduktan sonra
+            # değiştirilmiş evidence de redakte edilmeden DB'ye yazılmaz.
+            evidence = redact_sensitive_text(finding.evidence or '')
+            affected_url = redact_sensitive_url(finding.affected_url or '')
+
             # Aynı scanner + başlık + evidence + affected_url + parameter kombinasyonu
             # tam olarak tekrarlanıyorsa (örn. farklı tekniklerin aynı sonucu üretmesi)
             # yalnızca birebir aynı kayıt bir kez saklanır — farklı evidence/parametre
             # taşıyan bulgular asla birleştirilmez (CLAUDE.md §4).
             identity = (
-                scan_result.scanner, finding.title, finding.evidence or '',
-                finding.affected_url or '', finding.parameter or '',
+                scan_result.scanner, finding.title, evidence,
+                affected_url, finding.parameter or '',
             )
             if identity in seen:
                 continue
@@ -49,11 +56,11 @@ def _save_report(job: ScanJob, report) -> None:
                 scanner=scan_result.scanner,
                 severity=finding.severity.value,
                 title=finding.title,
-                evidence=finding.evidence or '',
+                evidence=evidence,
                 confidence=finding.confidence.value if finding.confidence else '',
                 status=finding.status.value if finding.status else '',
                 description=finding.description or '',
-                affected_url=finding.affected_url or '',
+                affected_url=affected_url,
                 parameter=finding.parameter or '',
                 owasp=finding.owasp or '',
                 cwe=finding.cwe or '',
@@ -79,7 +86,9 @@ def _run_in_background(job_id: int, target: str) -> None:
         # Kasıtlı geniş sınır: orkestrasyon zaten tek tek scanner hatalarını izole eder
         # (bkz. orchestrator.py) — burası yalnızca TAMAMEN beklenmeyen bir hatayı
         # (örn. DB bağlantı kaybı) yakalar. Tam detay sunucu loguna yazılır.
-        logger.exception("Scan job %s failed unexpectedly for target %r", job_id, target)
+        # Hedef URL kullanıcı girdisidir ve user:password@ içerebilir
+        logger.exception("Scan job %s failed unexpectedly for target %r",
+                         job_id, redact_sensitive_url(target))
         try:
             job = ScanJob.objects.get(id=job_id)
             job.status = 'FAILED'
@@ -95,8 +104,13 @@ def _run_in_background(job_id: int, target: str) -> None:
 
 
 def start_scan(target: str) -> ScanJob:
-    """Creates a ScanJob, launches the scan in a background thread, returns the job."""
-    job = ScanJob.objects.create(target=target, status='PENDING')
+    """Creates a ScanJob, launches the scan in a background thread, returns the job.
+
+    İki ayrı URL: DB'ye (ve dolayısıyla API/geçmişe) yalnızca güvenli görüntüleme
+    URL'si yazılır; ham AĞ URL'si yalnızca bellekte, bu işin thread argümanı olarak
+    scanner'lara ulaşır ve hiçbir yerde saklanmaz.
+    """
+    job = ScanJob.objects.create(target=redact_sensitive_url(target), status='PENDING')
     thread = threading.Thread(
         target=_run_in_background,
         args=(job.id, target),
