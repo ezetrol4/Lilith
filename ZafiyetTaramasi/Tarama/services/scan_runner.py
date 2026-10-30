@@ -5,6 +5,7 @@ from django.db import connection as db_connection
 from django.utils import timezone
 
 from .orchestrator import run_full_scan
+from .safe_http import OUTBOUND_BLOCKED_MESSAGE
 from ..models import ScanJob, ScanFinding
 
 logger = logging.getLogger(__name__)
@@ -19,12 +20,16 @@ def _save_report(job: ScanJob, report) -> None:
                         report.integrity, report.error_disclosure,
                         report.cmd, report.nosql]:
         if scan_result.error:
+            # SSRF politikasının engellediği istek, hedefe ait bir zafiyet değildir —
+            # vulnerability sayısına katılan MEDIUM bir bulgu üretmemeli.
+            blocked = scan_result.error == OUTBOUND_BLOCKED_MESSAGE
             findings.append(ScanFinding(
                 job=job,
                 scanner=scan_result.scanner,
-                severity='MEDIUM',
+                severity='INFO' if blocked else 'MEDIUM',
                 title='Tarama hatası',
                 evidence=scan_result.error,
+                status='INFORMATIONAL' if blocked else '',
             ))
         for finding in scan_result.findings:
             # Aynı scanner + başlık + evidence + affected_url + parameter kombinasyonu

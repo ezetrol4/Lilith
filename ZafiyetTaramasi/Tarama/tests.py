@@ -1,9 +1,9 @@
 import json
 import socket
 import ssl
-import urllib.error
 from unittest.mock import MagicMock, patch
 
+import requests
 from django.test import TestCase, Client
 
 from .scanners.base import Confidence, Finding, FindingStatus, ScanResult, Severity, summarize_findings
@@ -22,6 +22,52 @@ from .scanners.error_disclosure import ErrorDisclosureScanner
 from .scanners.cmd import CmdInjectionScanner
 from .scanners.nosql import NoSqlInjectionScanner
 from .services.ssrf_guard import SSRFError, validate_url
+
+
+# ---------------------------------------------------------------------------
+# Ağ tripwire'ı — test suite hiçbir koşulda gerçek DNS / ağ erişimi yapmamalı
+# ---------------------------------------------------------------------------
+
+class NetworkAccessAttempted(BaseException):
+    """Bir test gerçek DNS çözümlemesi veya socket bağlantısı denedi.
+
+    BaseException alt sınıfıdır: scanner'ların kasıtlı geniş `except Exception`
+    blokları bu hatayı yutup testi sessizce geçirmesin."""
+
+
+def _network_tripwire(name: str):
+    def _blocked(*args, **kwargs):
+        raise NetworkAccessAttempted(f"Test gerçek ağ erişimi denedi: socket.{name}{args!r}")
+    return _blocked
+
+
+# Bir test bu fonksiyonları kendisi mock'larsa yalnızca o testin süresince tripwire'ın
+# önüne geçer; mock kalkınca tripwire geri gelir.
+_NETWORK_TRIPWIRES = [
+    patch(f'socket.{name}', new=_network_tripwire(name))
+    for name in ('getaddrinfo', 'gethostbyname', 'gethostbyname_ex', 'gethostbyaddr', 'create_connection')
+] + [
+    patch.object(socket.socket, name, new=_network_tripwire(name))
+    for name in ('connect', 'connect_ex')
+]
+
+
+def setUpModule():
+    for tripwire in _NETWORK_TRIPWIRES:
+        tripwire.start()
+
+
+def tearDownModule():
+    for tripwire in reversed(_NETWORK_TRIPWIRES):
+        tripwire.stop()
+
+
+def _public_dns(ip: str = '93.184.216.34'):
+    """getaddrinfo yerine: her host'u verilen public IP'ye çözer (gerçek DNS yok)."""
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        family = socket.AF_INET6 if ':' in ip else socket.AF_INET
+        return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (ip, port or 0))]
+    return patch('socket.getaddrinfo', side_effect=fake_getaddrinfo)
 
 
 class FindingModelTest(TestCase):
@@ -218,7 +264,10 @@ class ScanFindingModelTest(TestCase):
 
 class SSRFGuardTest(TestCase):
     def test_public_url_passes(self):
-        validate_url('https://google.com')  # should not raise
+        # Eskiden google.com için gerçek DNS çözümlemesi yapıyordu — artık mock'lu
+        with _public_dns() as mock_resolve:
+            validate_url('https://google.com')  # should not raise
+        mock_resolve.assert_called()
 
     def test_localhost_blocked(self):
         with self.assertRaises(SSRFError):
@@ -241,8 +290,7 @@ class SSRFGuardTest(TestCase):
             validate_url('ftp://example.com')
 
     def test_ipv6_loopback_blocked(self):
-        """[::1] socket.gethostbyname ile çözülemediği için 'host çözülemedi' olarak reddedilir —
-        güvenli, fail-closed bir davranıştır (bypass değildir)."""
+        """[::1] bir IPv6 loopback literal'idir — DNS'e gidilmeden doğrudan reddedilir."""
         with self.assertRaises(SSRFError):
             validate_url('http://[::1]/')
 
@@ -251,11 +299,11 @@ class SSRFGuardTest(TestCase):
         with self.assertRaises(SSRFError):
             validate_url('http://attacker:password@127.0.0.1/')
 
-    @patch('Tarama.services.ssrf_guard.socket.gethostbyname')
+    @patch('Tarama.services.ssrf_guard.socket.getaddrinfo')
     def test_hostname_resolving_to_private_ip_blocked(self, mock_resolve):
         """Herkese açık görünen bir alan adı özel bir IP'ye çözülüyorsa yine engellenmeli
         (DNS rebinding senaryosu) — guard çözümlenen IP'yi kontrol eder, hostname'i değil."""
-        mock_resolve.return_value = '192.168.1.50'
+        mock_resolve.return_value = [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('192.168.1.50', 0))]
         with self.assertRaises(SSRFError):
             validate_url('http://looks-public.example.com/')
 
@@ -272,11 +320,14 @@ class SSRFGuardTest(TestCase):
 
 class HeaderScannerTest(TestCase):
     def _mock_urlopen(self, headers: dict):
-        mock_resp = MagicMock()
-        mock_resp.info.return_value = headers
-        return mock_resp
+        """HeaderScanner artık SSRF korumalı safe_http oturumunu kullanır (eskiden urllib).
+        Dönen değer mock'lanan requests.Session örneğidir: get() verilen header'larla
+        HTTP 200 yanıtı döner."""
+        mock_session = MagicMock()
+        mock_session.get.return_value = MagicMock(status_code=200, reason='OK', headers=headers)
+        return mock_session
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_present_header_is_info_severity(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({
             'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
@@ -293,7 +344,7 @@ class HeaderScannerTest(TestCase):
         self.assertIn('X-Frame-Options', info_titles)
         self.assertIn('Content-Security-Policy', info_titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_missing_headers_not_overclassified(self, mock_urlopen):
         """Eksik headerlar otomatik HIGH olmamalı — CLAUDE.md V1 severity rehberiyle uyumlu olmalı."""
         mock_urlopen.return_value = self._mock_urlopen({})
@@ -306,21 +357,21 @@ class HeaderScannerTest(TestCase):
         high_or_critical = [f for f in result.findings if f.severity in (Severity.HIGH, Severity.CRITICAL)]
         self.assertEqual(high_or_critical, [])
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_missing_xss_protection_is_info(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({})
         result = HeaderScanner().scan('https://example.com')
         finding = next(f for f in result.findings if f.title == 'X-XSS-Protection eksik')
         self.assertEqual(finding.severity, Severity.INFO)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_missing_hsts_not_reported_on_http_target(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({})
         result = HeaderScanner().scan('http://example.com')
         titles = [f.title for f in result.findings]
         self.assertNotIn('Strict-Transport-Security eksik', titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_csp_frame_ancestors_suppresses_xfo_duplicate(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({
             'Content-Security-Policy': "default-src 'self'; frame-ancestors 'none'",
@@ -329,7 +380,7 @@ class HeaderScannerTest(TestCase):
         titles = [f.title for f in result.findings]
         self.assertNotIn('X-Frame-Options eksik', titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_present_header_marked_secure_not_vulnerability(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({
             'Content-Security-Policy': "default-src 'self'",
@@ -338,7 +389,7 @@ class HeaderScannerTest(TestCase):
         finding = next(f for f in result.findings if f.title == 'Content-Security-Policy')
         self.assertEqual(finding.status, FindingStatus.SECURE)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_hsts_low_max_age_flagged(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({
             'Strict-Transport-Security': 'max-age=3600',
@@ -347,7 +398,7 @@ class HeaderScannerTest(TestCase):
         titles = [f.title for f in result.findings]
         self.assertIn('HSTS max-age yetersiz', titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_hsts_missing_includesubdomains_flagged(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({
             'Strict-Transport-Security': 'max-age=31536000',
@@ -356,7 +407,7 @@ class HeaderScannerTest(TestCase):
         titles = [f.title for f in result.findings]
         self.assertIn('HSTS includeSubDomains eksik', titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_csp_unsafe_inline_flagged(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({
             "Content-Security-Policy": "default-src 'self' 'unsafe-inline'",
@@ -365,23 +416,23 @@ class HeaderScannerTest(TestCase):
         titles = [f.title for f in result.findings]
         self.assertIn("CSP 'unsafe-inline' içeriyor", titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_xss_protection_disabled_flagged(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({'X-XSS-Protection': '0'})
         result = HeaderScanner().scan('https://example.com')
         titles = [f.title for f in result.findings]
         self.assertIn('X-XSS-Protection açıkça devre dışı bırakılmış', titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_server_version_leak_flagged(self, mock_urlopen):
         mock_urlopen.return_value = self._mock_urlopen({'Server': 'Apache/2.4.41'})
         result = HeaderScanner().scan('https://example.com')
         titles = [f.title for f in result.findings]
         self.assertIn('Server bilgi sızdırıyor', titles)
 
-    @patch('urllib.request.urlopen')
+    @patch('Tarama.scanners.headers.requests.Session')
     def test_connection_error_stored_in_result(self, mock_urlopen):
-        mock_urlopen.side_effect = urllib.error.URLError("Connection refused")
+        mock_urlopen.return_value.get.side_effect = requests.ConnectionError("Connection refused")
         result = HeaderScanner().scan('https://example.com')
         self.assertIsNotNone(result.error)
         self.assertEqual(result.findings, [])
@@ -398,6 +449,13 @@ def _make_open_ctx(recv_bytes=b''):
 
 
 class PortScannerTest(TestCase):
+    def setUp(self):
+        # Port bağlantıları artık safe_socket.connect_validated üzerinden: host her
+        # bağlantıdan önce getaddrinfo ile çözümlenip doğrulanır (mock'lu, gerçek DNS yok).
+        dns = _public_dns()
+        dns.start()
+        self.addCleanup(dns.stop)
+
     @patch('Tarama.scanners.ports.socket.gethostbyaddr')
     @patch('Tarama.scanners.ports.socket.gethostbyname')
     @patch('Tarama.scanners.ports.socket.create_connection')
@@ -1538,6 +1596,12 @@ class XssScannerTest(TestCase):
 # ---------------------------------------------------------------------------
 
 class SslScannerTest(TestCase):
+    def setUp(self):
+        # TLS bağlantıları artık safe_socket.connect_validated üzerinden (mock'lu DNS).
+        dns = _public_dns()
+        dns.start()
+        self.addCleanup(dns.stop)
+
     def _make_ssl_sock(self, version='TLSv1.3', cipher=('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)):
         sock = MagicMock()
         sock.__enter__ = MagicMock(return_value=sock)
@@ -3186,6 +3250,10 @@ class ScanJobStateTest(TestCase):
 class ApiContractTest(TestCase):
     def setUp(self):
         self.client = Client()
+        # views._parse_target → validate_url eskiden example.com için gerçek DNS yapıyordu
+        dns = _public_dns()
+        dns.start()
+        self.addCleanup(dns.stop)
 
     @patch('Tarama.views.HeaderScanner')
     def test_check_headers_endpoint_contract(self, MockScanner):
@@ -3428,3 +3496,942 @@ class SensitiveDataLeakageTest(TestCase):
         serialized = json.dumps(data)
         for secret in fake_secrets:
             self.assertNotIn(secret, serialized)
+
+
+# ---------------------------------------------------------------------------
+# P0-1: Giden istek SSRF zorlaması (services/safe_http.py)
+# ---------------------------------------------------------------------------
+
+import io
+
+from requests.adapters import HTTPAdapter
+from requests.structures import CaseInsensitiveDict
+
+from .services import safe_http
+from .services.safe_http import (
+    MAX_REDIRECTS, OUTBOUND_BLOCKED_MESSAGE, OutboundRequestBlocked, SafeSession,
+    SSRFGuardAdapter, safe_session,
+)
+from .services.ssrf_guard import is_blocked_ip
+
+_PUBLIC_IP = '93.184.216.34'
+_PUBLIC_IP_2 = '93.184.216.35'
+
+
+def _addrinfo(ip: str):
+    family = socket.AF_INET6 if ':' in ip else socket.AF_INET
+    return (family, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (ip, 0))
+
+
+class _FakeTransport:
+    """HTTPAdapter.send yerine geçer: ağa çıkmaz, URL → (status, headers, body) eşlemesi döner.
+    Tanımsız URL'ler 404 döner. Gönderilen her (method, url) kaydedilir."""
+
+    def __init__(self, routes: dict):
+        self.routes = routes
+        self.requested: list[tuple[str, str]] = []
+
+    def __call__(self, adapter, request, *args, **kwargs):
+        self.requested.append((request.method, request.url))
+        route = self.routes.get(request.url, (404, {}, ''))
+        if callable(route):
+            route = route(request)
+        status, headers, body = route
+        resp = requests.Response()
+        resp.status_code = status
+        resp.reason = 'Found' if 300 <= status < 400 else 'OK'
+        resp.headers = CaseInsensitiveDict(headers)
+        resp._content = body.encode() if isinstance(body, str) else body
+        resp._content_consumed = True
+        resp.raw = io.BytesIO(b'')
+        resp.url = request.url
+        resp.request = request
+        return resp
+
+    def hosts(self) -> set:
+        from urllib.parse import urlsplit
+        return {urlsplit(url).hostname for _method, url in self.requested}
+
+
+class _SafeHttpTestBase(TestCase):
+    """Gerçek ağ erişimi imkânsız: DNS + transport mock'lanır, socket.connect ve
+    gethostbyname çağrılırsa test başarısız olur."""
+
+    def setUp(self):
+        self._start(patch.object(socket.socket, 'connect',
+                                 side_effect=AssertionError('gerçek ağ bağlantısı denendi')))
+        self._start(patch('socket.gethostbyname',
+                          side_effect=AssertionError('gerçek DNS çözümlemesi denendi')))
+        self._start(patch('requests.utils.proxy_bypass', return_value=False))
+        # Engellenen istekler WARNING loglar — test çıktısını kirletmemesi için susturulur
+        self._start(patch.object(safe_http.logger, 'disabled', True))
+
+    def _start(self, patcher):
+        mocked = patcher.start()
+        self.addCleanup(patcher.stop)
+        return mocked
+
+    def _dns(self, mapping: dict):
+        """host → [ip, ...] veya host → çağrılabilir (her çağrıda farklı yanıt için)."""
+        def fake_getaddrinfo(host, port, *args, **kwargs):
+            ips = mapping.get(host)
+            if callable(ips):
+                ips = ips()
+            if ips is None:
+                raise socket.gaierror(socket.EAI_NONAME, 'Name or service not known')
+            return [_addrinfo(ip) for ip in ips]
+        return self._start(patch('Tarama.services.ssrf_guard.socket.getaddrinfo',
+                                 side_effect=fake_getaddrinfo))
+
+    def _transport(self, routes: dict) -> _FakeTransport:
+        """Test başına tek patch; tekrar çağrılırsa rotalar ve kayıt sıfırlanır (subTest döngüleri)."""
+        transport = getattr(self, '_fake_transport', None)
+        if transport is None:
+            transport = self._fake_transport = _FakeTransport(routes)
+            self._start(patch.object(HTTPAdapter, 'send', autospec=True, side_effect=transport))
+        else:
+            transport.routes = routes
+            transport.requested = []
+        return transport
+
+
+class SsrfPolicyRangeTest(TestCase):
+    """B, C, D, E, P: adres sınıflandırması — engellenmesi gerekenler ve public kalanlar."""
+
+    def test_blocked_addresses(self):
+        import ipaddress
+        blocked = [
+            '10.0.0.1', '172.16.5.4', '192.168.1.1',             # private
+            '127.0.0.1', '127.1.2.3',                            # loopback
+            '169.254.169.254', '169.254.0.1',                    # link-local / metadata
+            '100.64.0.1', '100.100.100.200', '100.127.255.254',  # shared address space
+            '0.0.0.0', '224.0.0.1', '239.255.255.250',           # unspecified, multicast
+            '240.0.0.1', '255.255.255.255',                      # reserved, broadcast
+            '::1', '::', 'fc00::1', 'fd12:3456::1', 'fe80::1', 'fec0::1', 'ff02::1',
+            '::ffff:127.0.0.1', '::ffff:10.0.0.1',               # IPv4-mapped
+            '2002:7f00:1::', '2002:a00:1::',                     # 6to4 içinde loopback/private
+            '64:ff9b::a00:1', '64:ff9b::7f00:1',                 # NAT64 içinde private/loopback
+        ]
+        for value in blocked:
+            with self.subTest(ip=value):
+                self.assertTrue(is_blocked_ip(ipaddress.ip_address(value)))
+
+    def test_public_addresses_not_blocked(self):
+        import ipaddress
+        for value in ('8.8.8.8', '1.1.1.1', _PUBLIC_IP, '100.63.255.255', '100.128.0.1',
+                      '2606:4700:4700::1111', '2a00:1450:4001::64'):
+            with self.subTest(ip=value):
+                self.assertFalse(is_blocked_ip(ipaddress.ip_address(value)))
+
+    def test_shared_address_space_rejected_by_validate_url(self):
+        """E: 100.64.0.0/10 önceden reddedilmiyordu."""
+        for url in ('http://100.64.0.1/', 'http://100.100.100.200/latest/meta-data/'):
+            with self.subTest(url=url), self.assertRaises(SSRFError):
+                validate_url(url)
+
+    def test_ipv6_private_literals_rejected_by_validate_url(self):
+        """P: IPv6 literal'leri DNS'e gitmeden reddedilir."""
+        for url in ('http://[::1]/', 'http://[fc00::1]/', 'http://[fe80::1]/',
+                    'http://[::ffff:127.0.0.1]/', 'http://[64:ff9b::a00:1]/'):
+            with self.subTest(url=url), self.assertRaises(SSRFError):
+                validate_url(url)
+
+    @patch('Tarama.services.ssrf_guard.socket.getaddrinfo')
+    def test_hostname_with_any_private_record_rejected(self, mock_resolve):
+        """A + AAAA kayıtlarından biri bile private ise host reddedilir."""
+        mock_resolve.return_value = [_addrinfo(_PUBLIC_IP), _addrinfo('::1')]
+        with self.assertRaises(SSRFError):
+            validate_url('https://mixed.example/')
+
+    @patch('Tarama.services.ssrf_guard.socket.getaddrinfo')
+    def test_hostname_resolving_to_ipv6_private_rejected(self, mock_resolve):
+        mock_resolve.return_value = [_addrinfo('fd00::5')]
+        with self.assertRaises(SSRFError):
+            validate_url('https://v6-internal.example/')
+
+
+class SafeSessionRequestTest(_SafeHttpTestBase):
+    """A, B, C, D, E: tekil istekler safe session üzerinden."""
+
+    def test_public_target_allowed(self):
+        """A"""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({'https://public.example/': (200, {}, 'ok')})
+
+        res = safe_session().get('https://public.example/', timeout=5)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(transport.requested, [('GET', 'https://public.example/')])
+
+    def test_private_loopback_link_local_and_shared_literals_rejected(self):
+        """B, C, D, E: ağa hiç çıkılmaz."""
+        self._dns({})
+        transport = self._transport({})
+        session = safe_session()
+        for url in ('http://10.0.0.5/', 'http://192.168.1.10/', 'http://127.0.0.1:8000/',
+                    'http://169.254.169.254/latest/meta-data/', 'http://100.64.0.1/',
+                    'http://[::1]/', 'http://[fd00::1]/'):
+            with self.subTest(url=url), self.assertRaises(OutboundRequestBlocked):
+                session.get(url, timeout=5)
+        self.assertEqual(transport.requested, [])
+
+    def test_hostname_resolving_to_private_ip_rejected_before_send(self):
+        self._dns({'intranet.example': ['10.0.0.7']})
+        transport = self._transport({})
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().get('https://intranet.example/', timeout=5)
+        self.assertEqual(transport.requested, [])
+
+    def test_non_http_scheme_rejected(self):
+        self._transport({})
+        for url in ('file:///etc/passwd', 'gopher://public.example/', 'ftp://public.example/'):
+            with self.subTest(url=url), self.assertRaises(OutboundRequestBlocked):
+                safe_session().get(url)
+
+    def test_post_options_and_trace_also_enforced(self):
+        self._dns({})
+        transport = self._transport({})
+        session = safe_session()
+        with self.assertRaises(OutboundRequestBlocked):
+            session.post('http://10.0.0.5/login', data={'u': 'x'})
+        with self.assertRaises(OutboundRequestBlocked):
+            session.options('http://127.0.0.1/')
+        with self.assertRaises(OutboundRequestBlocked):
+            session.request('TRACE', 'http://169.254.169.254/')
+        self.assertEqual(transport.requested, [])
+
+    def test_blocked_error_message_is_sanitized(self):
+        """İç IP detayı yalnızca sunucu tarafı `reason`'da, str() sabit mesaj."""
+        self._transport({})
+        with self.assertRaises(OutboundRequestBlocked) as ctx:
+            safe_session().get('http://10.9.8.7/')
+        self.assertEqual(str(ctx.exception), OUTBOUND_BLOCKED_MESSAGE)
+        self.assertNotIn('10.9.8.7', str(ctx.exception))
+        self.assertIn('10.9.8.7', ctx.exception.reason)
+        self.assertIsInstance(ctx.exception, requests.RequestException)
+
+    def test_blocked_request_is_logged_server_side(self):
+        self._transport({})
+        with patch.object(safe_http.logger, 'disabled', False), \
+                self.assertLogs('Tarama.services.safe_http', level='WARNING') as logs:
+            with self.assertRaises(OutboundRequestBlocked):
+                safe_session().get('http://127.0.0.1/secret?token=abc')
+        self.assertIn('127.0.0.1', logs.output[0])
+        self.assertNotIn('token=abc', logs.output[0])  # payload/query loga taşınmaz
+
+
+class SafeSessionRedirectTest(_SafeHttpTestBase):
+    """F–L: yönlendirmeler requests'e bırakılmaz; her hedef ağa çıkmadan doğrulanır."""
+
+    def test_redirect_to_loopback_rejected(self):
+        """F"""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            'https://public.example/': (302, {'Location': 'http://127.0.0.1/admin'}, ''),
+        })
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().get('https://public.example/')
+        self.assertNotIn('127.0.0.1', transport.hosts())
+
+    def test_redirect_to_metadata_rejected(self):
+        """G"""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            'https://public.example/': (301, {'Location': 'http://169.254.169.254/latest/meta-data/'}, ''),
+        })
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().get('https://public.example/')
+        self.assertNotIn('169.254.169.254', transport.hosts())
+
+    def test_redirect_to_private_10_network_rejected(self):
+        """H"""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            'https://public.example/': (307, {'Location': 'http://10.1.2.3/internal'}, ''),
+        })
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().post('https://public.example/', data={'a': '1'})
+        self.assertNotIn('10.1.2.3', transport.hosts())
+
+    def test_redirect_to_hostname_resolving_private_rejected(self):
+        self._dns({'public.example': [_PUBLIC_IP], 'internal.example': ['192.168.0.9']})
+        transport = self._transport({
+            'https://public.example/': (302, {'Location': 'https://internal.example/'}, ''),
+        })
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().get('https://public.example/')
+        self.assertNotIn('internal.example', transport.hosts())
+
+    def test_redirect_to_file_scheme_rejected(self):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        self._transport({'https://public.example/': (302, {'Location': 'file:///etc/passwd'}, '')})
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().get('https://public.example/')
+
+    def test_public_to_public_redirect_followed(self):
+        """I"""
+        self._dns({'a.example': [_PUBLIC_IP], 'b.example': [_PUBLIC_IP_2]})
+        transport = self._transport({
+            'https://a.example/': (302, {'Location': 'https://b.example/final'}, ''),
+            'https://b.example/final': (200, {}, 'landed'),
+        })
+        res = safe_session().get('https://a.example/')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.url, 'https://b.example/final')
+        self.assertEqual(res.text, 'landed')
+        self.assertEqual(len(res.history), 1)
+        self.assertEqual([url for _m, url in transport.requested],
+                         ['https://a.example/', 'https://b.example/final'])
+
+    def test_relative_redirect_followed(self):
+        """J"""
+        self._dns({'a.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            'https://a.example/start/page': (301, {'Location': '../next?x=1'}, ''),
+            'https://a.example/next?x=1': (200, {}, 'ok'),
+        })
+        res = safe_session().get('https://a.example/start/page')
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(transport.requested[-1], ('GET', 'https://a.example/next?x=1'))
+
+    def test_303_after_post_becomes_get_without_body(self):
+        """requests ile aynı yöntem kuralı: 303 → GET, gövde taşınmaz."""
+        self._dns({'a.example': [_PUBLIC_IP]})
+        seen_bodies = []
+
+        def home(request):
+            seen_bodies.append(request.body)
+            return (200, {}, 'home')
+
+        transport = self._transport({
+            'https://a.example/login': (303, {'Location': '/home'}, ''),
+            'https://a.example/home': home,
+        })
+        res = safe_session().post('https://a.example/login', data={'user': 'x'})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(transport.requested, [('POST', 'https://a.example/login'),
+                                               ('GET', 'https://a.example/home')])
+        self.assertEqual(seen_bodies, [None])
+
+    def test_allow_redirects_false_returns_3xx_without_following(self):
+        self._dns({'a.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            'https://a.example/': (302, {'Location': 'http://127.0.0.1/'}, ''),
+        })
+        res = safe_session().get('https://a.example/', allow_redirects=False)
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(len(transport.requested), 1)
+
+    def test_redirect_loop_stops_safely(self):
+        """K"""
+        self._dns({'a.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            'https://a.example/a': (302, {'Location': '/b'}, ''),
+            'https://a.example/b': (302, {'Location': '/a'}, ''),
+        })
+        with self.assertRaises(requests.TooManyRedirects):
+            safe_session().get('https://a.example/a')
+        self.assertLessEqual(len(transport.requested), 4)
+
+    def test_self_redirect_once_is_allowed(self):
+        """'Cookie set et → kendine yönlendir' gibi meşru akış döngü sayılmaz."""
+        self._dns({'a.example': [_PUBLIC_IP]})
+        calls = {'n': 0}
+
+        def page(request):
+            calls['n'] += 1
+            return (302, {'Location': '/page'}, '') if calls['n'] == 1 else (200, {}, 'ok')
+
+        self._transport({'https://a.example/page': page})
+        res = safe_session().get('https://a.example/page')
+        self.assertEqual(res.status_code, 200)
+
+    def test_excessive_redirects_stop_safely(self):
+        """L"""
+        self._dns({'a.example': [_PUBLIC_IP]})
+        routes = {f'https://a.example/r{i}': (302, {'Location': f'/r{i + 1}'}, '') for i in range(50)}
+        transport = self._transport(routes)
+        with self.assertRaises(requests.TooManyRedirects):
+            safe_session().get('https://a.example/r0')
+        self.assertEqual(len(transport.requested), MAX_REDIRECTS + 1)
+
+
+class SafeSessionDnsRevalidationTest(_SafeHttpTestBase):
+    """O: DNS her giden istekte yeniden doğrulanır; bağlantı doğrulanan IP'ye sabitlenir."""
+
+    def test_host_rebinding_to_private_on_later_request_rejected(self):
+        answers = iter([[_PUBLIC_IP], ['127.0.0.1']])
+        self._dns({'rebind.example': lambda: next(answers)})
+        transport = self._transport({'https://rebind.example/': (200, {}, 'ok')})
+        session = safe_session()
+
+        self.assertEqual(session.get('https://rebind.example/').status_code, 200)
+        with self.assertRaises(OutboundRequestBlocked):
+            session.get('https://rebind.example/')
+        self.assertEqual(len(transport.requested), 1)
+
+    def test_rebinding_between_redirect_hops_rejected(self):
+        answers = iter([[_PUBLIC_IP], ['10.0.0.1']])
+        self._dns({'rebind.example': lambda: next(answers)})
+        transport = self._transport({
+            'https://rebind.example/': (302, {'Location': '/again'}, ''),
+        })
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().get('https://rebind.example/')
+        self.assertEqual(transport.requested, [('GET', 'https://rebind.example/')])
+
+    def test_pinned_connection_validates_and_connects_only_to_validated_ip(self):
+        """Soket açılırken host yeniden çözümlenir ve YALNIZCA doğrulanan IP'ye bağlanılır."""
+        from .services.safe_http import _PinnedHTTPConnection
+        self._dns({'pin.example': [_PUBLIC_IP]})
+        with patch('Tarama.services.safe_http.urllib3_connection.create_connection') as mock_connect:
+            _PinnedHTTPConnection('pin.example', 80, timeout=3)._new_conn()
+        self.assertEqual(mock_connect.call_args[0][0], (_PUBLIC_IP, 80))
+
+    def test_pinned_connection_blocks_private_resolution_at_connect_time(self):
+        """Adapter kontrolü ile soket açılışı arasında rebinding olsa bile bağlanılmaz."""
+        from urllib3.exceptions import NewConnectionError
+        from .services.safe_http import _PinnedHTTPSConnection
+        self._dns({'pin.example': ['169.254.169.254']})
+        with patch('Tarama.services.safe_http.urllib3_connection.create_connection') as mock_connect:
+            with self.assertRaises(NewConnectionError):
+                _PinnedHTTPSConnection('pin.example', 443, timeout=3)._new_conn()
+        mock_connect.assert_not_called()
+
+    def _full_stack_session(self):
+        session = safe_session(requests.Session())
+        session._inner.trust_env = False  # ortam proxy ayarları testi etkilemesin
+        return session
+
+    def test_full_stack_request_connects_only_to_validated_ip(self):
+        """Gerçek requests → adapter → urllib3 → pinned bağlantı zinciri (soket mock'lu)."""
+        self._dns({'pin.example': [_PUBLIC_IP]})
+        with patch('Tarama.services.safe_http.urllib3_connection.create_connection',
+                   side_effect=ConnectionRefusedError) as mock_connect:
+            with self.assertRaises(requests.ConnectionError):
+                self._full_stack_session().get('http://pin.example/', timeout=3)
+        self.assertEqual(mock_connect.call_args[0][0], (_PUBLIC_IP, 80))
+
+    def test_full_stack_rebinding_between_check_and_connect_rejected(self):
+        """Adapter kontrolünde public, soket açılışında private → bağlantı kurulmaz."""
+        answers = iter([[_PUBLIC_IP], ['127.0.0.1']])
+        self._dns({'rebind.example': lambda: next(answers)})
+        with patch('Tarama.services.safe_http.urllib3_connection.create_connection') as mock_connect:
+            with self.assertRaises(requests.ConnectionError):
+                self._full_stack_session().get('https://rebind.example/', timeout=3)
+        mock_connect.assert_not_called()
+
+    def test_adapter_uses_pinned_connection_pools(self):
+        from .services.safe_http import _PinnedHTTPConnectionPool, _PinnedHTTPSConnectionPool
+        pools = SSRFGuardAdapter().poolmanager.pool_classes_by_scheme
+        self.assertIs(pools['http'], _PinnedHTTPConnectionPool)
+        self.assertIs(pools['https'], _PinnedHTTPSConnectionPool)
+
+
+class ScannerOutboundEnforcementTest(_SafeHttpTestBase):
+    """M, N + tüm HTTP scanner'larının korumalı oturum kullandığının doğrulanması."""
+
+    _TARGET = 'https://public.example/'
+
+    def _page_with_form(self, action: str) -> str:
+        return (f'<html><body><form action="{action}" method="post">'
+                f'<input name="q"></form></body></html>')
+
+    def test_every_http_scanner_uses_safe_session(self):
+        for scanner_cls in (AccessControlScanner, AuthScanner, CmsScanner, ErrorDisclosureScanner,
+                            IntegrityScanner, SqlInjectionScanner, CmdInjectionScanner,
+                            NoSqlInjectionScanner, XssScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                self.assertIsInstance(scanner_cls()._make_session(), SafeSession)
+
+    def test_injected_raw_session_is_wrapped(self):
+        for scanner_cls in (SqlInjectionScanner, CmdInjectionScanner, NoSqlInjectionScanner, XssScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                session = scanner_cls(session=requests.Session())._make_session()
+                self.assertIsInstance(session, SafeSession)
+
+    def test_form_action_to_private_ip_never_requested(self):
+        """M: form action güvenilmeyen girdidir — iç adrese gönderim yapılmaz, tarama çökmez."""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        for scanner_cls in (XssScanner, SqlInjectionScanner, CmdInjectionScanner, NoSqlInjectionScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                transport = self._transport({
+                    self._TARGET: (200, {'Content-Type': 'text/html'},
+                                   self._page_with_form('http://10.0.0.5/submit')),
+                })
+                result = scanner_cls().scan(self._TARGET)
+                self.assertIsNone(result.error)
+                self.assertNotIn('10.0.0.5', transport.hosts())
+
+    def test_form_action_to_host_resolving_private_never_requested(self):
+        self._dns({'public.example': [_PUBLIC_IP], 'intranet.example': ['172.16.0.3']})
+        transport = self._transport({
+            self._TARGET: (200, {}, self._page_with_form('https://intranet.example/api/login')),
+        })
+        result = XssScanner().scan(self._TARGET)
+        self.assertIsNone(result.error)
+        self.assertNotIn('intranet.example', transport.hosts())
+
+    def test_auth_form_action_to_private_ip_never_requested(self):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        login = ('<html><body><form action="http://192.168.0.10/do-login" method="post">'
+                 '<input name="username"><input type="password" name="password"></form></body></html>')
+        transport = self._transport({self._TARGET: (200, {}, login)})
+        AuthScanner().scan(self._TARGET)
+        self.assertNotIn('192.168.0.10', transport.hosts())
+
+    def test_relative_form_action_resolves_against_page_and_is_submitted(self):
+        """N"""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({self._TARGET: (200, {}, self._page_with_form('/search'))})
+        XssScanner().scan(self._TARGET)
+        self.assertIn(('POST', 'https://public.example/search'), transport.requested)
+
+    def test_target_redirecting_to_internal_address_not_followed(self):
+        """Tarama sırasında hedefin kendisi iç adrese yönlendirirse hiçbir scanner takip etmez."""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({
+            self._TARGET: (302, {'Location': 'http://169.254.169.254/latest/meta-data/'}, ''),
+        })
+        for scanner_cls in (HeaderScanner, CmsScanner, IntegrityScanner, ErrorDisclosureScanner,
+                            AccessControlScanner, AuthScanner, XssScanner, SqlInjectionScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                scanner_cls().scan(self._TARGET)
+        self.assertNotIn('169.254.169.254', transport.hosts())
+
+    def test_header_scanner_blocked_redirect_sets_sanitized_error(self):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        self._transport({self._TARGET: (302, {'Location': 'http://127.0.0.1/'}, '')})
+        result = HeaderScanner().scan(self._TARGET)
+        self.assertEqual(result.findings, [])
+        self.assertIn(OUTBOUND_BLOCKED_MESSAGE, result.error)
+        self.assertNotIn('127.0.0.1', result.error)
+
+
+class OutboundBlockReportingTest(_SafeHttpTestBase):
+    """Engellenen istek yanıltıcı bir MEDIUM bulguya dönüşmemeli, iç IP API'ye sızmamalı."""
+
+    def test_orchestrator_replaces_blocked_error_with_sanitized_message(self):
+        from .services.orchestrator import _run_scanner
+        self._dns({'public.example': [_PUBLIC_IP]})
+        self._transport({'https://public.example/': (302, {'Location': 'http://10.0.0.1/'}, '')})
+
+        result = _run_scanner(CmsScanner(), 'https://public.example/')
+
+        self.assertEqual(result.error, OUTBOUND_BLOCKED_MESSAGE)
+        self.assertEqual(result.findings, [])
+
+    def test_orchestrator_keeps_unrelated_errors_unchanged(self):
+        from .services.orchestrator import _run_scanner
+        scanner = MagicMock()
+        scanner.scan.return_value = ScanResult(scanner='x', target='https://public.example/',
+                                               error='Ana sayfa alınamadı')
+        self.assertEqual(_run_scanner(scanner, 'https://public.example/').error, 'Ana sayfa alınamadı')
+
+    def test_blocked_scan_error_persisted_as_informational_not_medium(self):
+        from .services.scan_runner import _save_report
+        from .services.orchestrator import ScanReport
+
+        job = ScanJob.objects.create(target='https://public.example/', status='RUNNING')
+
+        def empty(name):
+            return ScanResult(scanner=name, target='https://public.example/')
+
+        report = ScanReport(
+            target='https://public.example/',
+            headers=ScanResult(scanner='headers', target='https://public.example/',
+                               error=OUTBOUND_BLOCKED_MESSAGE),
+            ports=empty('ports'), sql=empty('sql'), xss=empty('xss'), ssl=empty('ssl'),
+            dns=empty('dns'),
+            cms=ScanResult(scanner='cms', target='https://public.example/', error='Ana sayfa alınamadı'),
+            access_control=empty('access_control'), auth=empty('auth'), integrity=empty('integrity'),
+            error_disclosure=empty('error_disclosure'), cmd=empty('cmd'), nosql=empty('nosql'),
+        )
+        _save_report(job, report)
+
+        blocked = job.findings.get(scanner='headers')
+        self.assertEqual(blocked.severity, 'INFO')
+        self.assertEqual(blocked.status, 'INFORMATIONAL')
+        # İlgisiz tarama hataları mevcut davranışını korur
+        self.assertEqual(job.findings.get(scanner='cms').severity, 'MEDIUM')
+
+        summary = summarize_findings(list(job.findings.all()))
+        self.assertEqual(summary['severity']['info'], 0)
+        self.assertEqual(summary['informational'], 1)
+
+
+# ---------------------------------------------------------------------------
+# P0-1 (devam): ham socket SSRF, proxy ortamı, redirect semantiği, ağ tripwire'ı
+# ---------------------------------------------------------------------------
+
+import os
+
+from .services.safe_socket import (
+    OutboundConnectionBlocked, check_public_address, connect_validated, resolve_public_addresses,
+)
+
+
+def _sequenced_dns(*answers):
+    """Her getaddrinfo çağrısında sıradaki yanıtı, sonra son yanıtı döner (rebinding)."""
+    remaining = list(answers)
+
+    def next_answer():
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+    return next_answer
+
+
+class NetworkTripwireTest(TestCase):
+    """K: test suite gerçek DNS / socket bağlantısı yapamaz."""
+
+    def test_real_dns_resolution_is_blocked(self):
+        for call in (lambda: socket.getaddrinfo('example.com', 443),
+                     lambda: socket.gethostbyname('example.com'),
+                     lambda: socket.gethostbyaddr('example.com')):
+            with self.assertRaises(NetworkAccessAttempted):
+                call()
+
+    def test_real_socket_connection_is_blocked(self):
+        with self.assertRaises(NetworkAccessAttempted):
+            socket.create_connection(('93.184.216.34', 80), timeout=1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with self.assertRaises(NetworkAccessAttempted):
+                sock.connect(('93.184.216.34', 80))
+        finally:
+            sock.close()
+
+    def test_tripwire_cannot_be_swallowed_by_broad_except(self):
+        """Scanner'lardaki `except Exception` blokları tripwire'ı yutamaz."""
+        self.assertFalse(issubclass(NetworkAccessAttempted, Exception))
+
+
+class SafeSocketHelperTest(_SafeHttpTestBase):
+
+    def test_connect_validated_uses_validated_ip_literal(self):
+        self._dns({'svc.example': [_PUBLIC_IP]})
+        with patch('socket.create_connection') as mock_connect:
+            connect_validated('svc.example', 25, timeout=2)
+        mock_connect.assert_called_once_with((_PUBLIC_IP, 25), timeout=2)
+
+    def test_connect_validated_rejects_if_any_address_private(self):
+        self._dns({'mixed.example': [_PUBLIC_IP, '10.0.0.8']})
+        with patch('socket.create_connection') as mock_connect:
+            with self.assertRaises(OutboundConnectionBlocked):
+                connect_validated('mixed.example', 22, timeout=2)
+        mock_connect.assert_not_called()
+
+    def test_connect_validated_tries_next_validated_address(self):
+        self._dns({'multi.example': [_PUBLIC_IP, _PUBLIC_IP_2]})
+        with patch('socket.create_connection',
+                   side_effect=[ConnectionRefusedError, MagicMock()]) as mock_connect:
+            connect_validated('multi.example', 443, timeout=2)
+        self.assertEqual([c.args[0] for c in mock_connect.call_args_list],
+                         [(_PUBLIC_IP, 443), (_PUBLIC_IP_2, 443)])
+
+    def test_unresolvable_host_is_connection_error_not_policy_block(self):
+        """DNS hatası 'engellendi' olarak raporlanmaz — mevcut 'bağlantı yok' davranışı korunur."""
+        self._dns({})
+        with self.assertRaises(socket.gaierror):
+            resolve_public_addresses('nx.example')
+        with safe_http.track_blocked_requests() as tracker:
+            with self.assertRaises(requests.ConnectionError) as ctx:
+                safe_session().get('https://nx.example/')
+        self.assertNotIsInstance(ctx.exception, OutboundRequestBlocked)
+        self.assertEqual(tracker.blocked, 0)
+
+    def test_blocked_exception_is_not_oserror_and_is_sanitized(self):
+        """OSError olsaydı scanner'ların `except OSError` blokları onu 'port kapalı' sayardı."""
+        with self.assertRaises(OutboundConnectionBlocked) as ctx:
+            check_public_address('169.254.169.254')
+        self.assertNotIsInstance(ctx.exception, OSError)
+        self.assertEqual(str(ctx.exception), OUTBOUND_BLOCKED_MESSAGE)
+
+
+class PortScannerSsrfTest(_SafeHttpTestBase):
+
+    def _scan(self, host='rebind.example', conn_side_effect=None):
+        with patch('Tarama.scanners.ports.socket.gethostbyname', return_value=_PUBLIC_IP), \
+             patch('Tarama.scanners.ports.socket.gethostbyaddr', return_value=(host, [], [_PUBLIC_IP])), \
+             patch('socket.create_connection', side_effect=conn_side_effect) as mock_connect:
+            result = PortScanner().scan(f'https://{host}')
+        return result, mock_connect
+
+    def test_dns_rebinding_after_api_validation_blocked(self):
+        """A: API girişinde public, port taraması sırasında private → hiçbir bağlantı yok."""
+        self._dns({'rebind.example': _sequenced_dns([_PUBLIC_IP], ['10.0.0.5'])})
+        validate_url('https://rebind.example/')  # API girişi: geçer
+
+        result, mock_connect = self._scan()
+
+        mock_connect.assert_not_called()
+        self.assertEqual(result.error, OUTBOUND_BLOCKED_MESSAGE)
+        self.assertFalse(any('/' in f.title and f.title != 'host_name' for f in result.findings),
+                         'Engellenen hedef için port sonucu raporlanmamalı')
+        self.assertNotIn('10.0.0.5', result.error)
+
+    def test_rebinding_mid_scan_blocks_whole_result(self):
+        self._dns({'rebind.example': _sequenced_dns(*([[_PUBLIC_IP]] * 5 + [['127.0.0.1']]))})
+
+        result, mock_connect = self._scan(conn_side_effect=ConnectionRefusedError)
+
+        self.assertEqual(result.error, OUTBOUND_BLOCKED_MESSAGE)
+        for call in mock_connect.call_args_list:
+            self.assertEqual(call.args[0][0], _PUBLIC_IP)
+
+    def test_public_destination_still_scanned_via_validated_ip(self):
+        """B: public hedefte port taraması aynen çalışır; bağlantı hostname'e değil IP'ye."""
+        self._dns({'public.example': [_PUBLIC_IP]})
+
+        def connect(address, timeout=None):
+            if address[1] == 22:
+                return _make_open_ctx(b'SSH-2.0-OpenSSH_9.6\r\n')
+            raise ConnectionRefusedError
+
+        result, mock_connect = self._scan(host='public.example', conn_side_effect=connect)
+
+        self.assertIsNone(result.error)
+        evidence = {f.title: f.evidence for f in result.findings}
+        self.assertTrue(evidence['22/SSH'].startswith('ACIK'))
+        self.assertEqual(evidence['80/HTTP'], 'KAPALI')
+        self.assertEqual(mock_connect.call_count, 19)
+        self.assertEqual({c.args[0][0] for c in mock_connect.call_args_list}, {_PUBLIC_IP})
+        self.assertTrue(all(c.kwargs['timeout'] == PortScanner().timeout for c in mock_connect.call_args_list))
+
+    def test_blocked_port_scan_persisted_as_informational(self):
+        from .services.orchestrator import _run_scanner
+        self._dns({'rebind.example': ['192.168.1.1']})
+        with patch('Tarama.scanners.ports.socket.gethostbyname', return_value=_PUBLIC_IP), \
+             patch('Tarama.scanners.ports.socket.gethostbyaddr', side_effect=socket.herror), \
+             patch('socket.create_connection') as mock_connect:
+            result = _run_scanner(PortScanner(), 'https://rebind.example')
+        mock_connect.assert_not_called()
+        self.assertEqual(result.error, OUTBOUND_BLOCKED_MESSAGE)
+
+
+class SslScannerSsrfTest(_SafeHttpTestBase):
+
+    def _tls_mocks(self):
+        ssl_sock = MagicMock()
+        ssl_sock.__enter__ = MagicMock(return_value=ssl_sock)
+        ssl_sock.__exit__ = MagicMock(return_value=False)
+        ssl_sock.version.return_value = 'TLSv1.3'
+        ssl_sock.cipher.return_value = ('TLS_AES_256_GCM_SHA384', 'TLSv1.3', 256)
+        ssl_sock.getpeercert.return_value = {}
+        raw_sock = MagicMock()
+        raw_sock.__enter__ = MagicMock(return_value=raw_sock)
+        raw_sock.__exit__ = MagicMock(return_value=False)
+        ctx = MagicMock()
+        ctx.wrap_socket.return_value = ssl_sock
+        return raw_sock, ctx
+
+    def test_https_target_rebinding_to_private_blocked(self):
+        """C"""
+        self._dns({'rebind.example': _sequenced_dns([_PUBLIC_IP], ['169.254.169.254'])})
+        validate_url('https://rebind.example/')
+
+        with patch('socket.create_connection') as mock_connect, \
+             patch('Tarama.scanners.ssl_tls.ssl.create_default_context') as mock_ctx:
+            result = SslScanner().scan('https://rebind.example')
+
+        mock_connect.assert_not_called()
+        mock_ctx.return_value.wrap_socket.assert_not_called()
+        self.assertEqual(result.error, OUTBOUND_BLOCKED_MESSAGE)
+        self.assertEqual(result.findings, [])
+
+    def test_http_target_rebinding_not_reported_as_https_missing(self):
+        """Engellenen 443 kontrolü yanlış bir 'HTTPS desteklenmiyor' HIGH bulgusu üretmemeli."""
+        self._dns({'rebind.example': ['127.0.0.1']})
+        with patch('socket.create_connection') as mock_connect:
+            result = SslScanner().scan('http://rebind.example')
+        mock_connect.assert_not_called()
+        self.assertEqual(result.error, OUTBOUND_BLOCKED_MESSAGE)
+        self.assertEqual(result.findings, [])
+
+    def test_connects_to_validated_ip_but_sni_uses_original_hostname(self):
+        """D"""
+        self._dns({'tls.example': [_PUBLIC_IP]})
+        raw_sock, ctx = self._tls_mocks()
+        with patch('socket.create_connection', return_value=raw_sock) as mock_connect, \
+             patch('Tarama.scanners.ssl_tls.ssl.create_default_context', return_value=ctx):
+            result = SslScanner().scan('https://tls.example')
+
+        self.assertIsNone(result.error)
+        self.assertGreaterEqual(mock_connect.call_count, 2)  # protokol + sertifika aşaması
+        for call in mock_connect.call_args_list:
+            self.assertEqual(call.args[0], (_PUBLIC_IP, 443))
+        self.assertGreaterEqual(ctx.wrap_socket.call_count, 2)
+        for call in ctx.wrap_socket.call_args_list:
+            self.assertIs(call.args[0], raw_sock)
+            self.assertEqual(call.kwargs['server_hostname'], 'tls.example')
+
+    def test_certificate_stage_rebinding_does_not_connect(self):
+        """Protokol aşamasından sonra rebinding olursa sertifika aşaması bağlanmaz."""
+        self._dns({'tls.example': _sequenced_dns([_PUBLIC_IP], ['10.1.1.1'])})
+        raw_sock, ctx = self._tls_mocks()
+        with patch('socket.create_connection', return_value=raw_sock) as mock_connect, \
+             patch('Tarama.scanners.ssl_tls.ssl.create_default_context', return_value=ctx):
+            SslScanner().scan('https://tls.example')
+        self.assertEqual(mock_connect.call_count, 1)
+        self.assertEqual(mock_connect.call_args.args[0], (_PUBLIC_IP, 443))
+
+
+class DnsZoneTransferSsrfTest(_SafeHttpTestBase):
+    """E–H: DNS yanıtından gelen NS adresleri güvenilmez girdidir."""
+
+    def _scan(self, ns_ips: dict):
+        scanner = DnsScanner()
+        scanner._query = MagicMock(side_effect=lambda name, rdtype: (
+            sorted(f'{ns}.' for ns in ns_ips) if rdtype == 'NS' else []
+        ))
+        mock_zone = MagicMock()
+        mock_zone.nodes.keys.return_value = ['www.example.com.']
+        with patch('Tarama.scanners.dns_scan.socket.gethostbyname',
+                   side_effect=lambda host: ns_ips[host]), \
+             patch('Tarama.scanners.dns_scan.dns.query.xfr', return_value=iter([])) as mock_xfr, \
+             patch('Tarama.scanners.dns_scan.dns.zone.from_xfr', return_value=mock_zone):
+            result = scanner.scan('https://victim.example')
+        return result, mock_xfr
+
+    def _assert_no_axfr_and_no_claim(self, result, mock_xfr):
+        mock_xfr.assert_not_called()
+        titles = [f.title for f in result.findings]
+        self.assertNotIn('Zone Transfer izin veriliyor (AXFR)', titles)
+        self.assertNotIn('Zone Transfer engellendi', titles)
+
+    def test_nameserver_loopback_rejected(self):
+        """E"""
+        self._assert_no_axfr_and_no_claim(*self._scan({'ns1.victim.example': '127.0.0.1'}))
+
+    def test_nameserver_rfc1918_rejected(self):
+        """F"""
+        for ip in ('10.0.0.53', '172.20.0.53', '192.168.1.53'):
+            with self.subTest(ip=ip):
+                self._assert_no_axfr_and_no_claim(*self._scan({'ns1.victim.example': ip}))
+
+    def test_nameserver_metadata_link_local_rejected(self):
+        """G"""
+        self._assert_no_axfr_and_no_claim(*self._scan({'ns1.victim.example': '169.254.169.254'}))
+
+    def test_nameserver_shared_and_reserved_rejected(self):
+        for ip in ('100.64.0.53', '240.0.0.1', '0.0.0.0'):
+            with self.subTest(ip=ip):
+                self._assert_no_axfr_and_no_claim(*self._scan({'ns1.victim.example': ip}))
+
+    def test_public_nameserver_still_tested(self):
+        """H: public NS'e AXFR denenir ve mevcut bulgu semantiği aynen korunur."""
+        result, mock_xfr = self._scan({'ns1.victim.example': '1.2.3.4'})
+        mock_xfr.assert_called_once()
+        self.assertEqual(mock_xfr.call_args.args[0], '1.2.3.4')
+        allowed = next(f for f in result.findings if f.title == 'Zone Transfer izin veriliyor (AXFR)')
+        self.assertEqual(allowed.status, FindingStatus.CONFIRMED)
+
+    def test_private_nameserver_skipped_public_one_still_tested(self):
+        result, mock_xfr = self._scan({'ns1.victim.example': '10.0.0.53',
+                                       'ns2.victim.example': '1.2.3.4'})
+        self.assertEqual([c.args[0] for c in mock_xfr.call_args_list], ['1.2.3.4'])
+
+
+class SafeSessionProxyEnvironmentTest(_SafeHttpTestBase):
+    """I: ortamdaki proxy değişkenleri SafeSession trafiğini yönlendiremez."""
+
+    _PROXY_ENV = {
+        'HTTP_PROXY': 'http://10.0.0.1:3128', 'HTTPS_PROXY': 'http://10.0.0.1:3128',
+        'ALL_PROXY': 'socks5://10.0.0.1:1080', 'http_proxy': 'http://10.0.0.1:3128',
+        'https_proxy': 'http://10.0.0.1:3128', 'NO_PROXY': '', 'no_proxy': '',
+    }
+
+    def test_safe_session_does_not_trust_environment(self):
+        self.assertFalse(safe_session()._inner.trust_env)
+        self.assertFalse(safe_session(requests.Session())._inner.trust_env)
+
+    def test_environment_proxy_not_passed_to_transport(self):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        transport = self._transport({'https://public.example/': (200, {}, 'ok')})
+        with patch.dict(os.environ, self._PROXY_ENV):
+            safe_session().get('https://public.example/')
+        send_mock = HTTPAdapter.send
+        self.assertEqual(send_mock.call_args.kwargs.get('proxies'), {})
+        self.assertEqual(transport.requested, [('GET', 'https://public.example/')])
+
+    def test_environment_proxy_does_not_redirect_connection(self):
+        """Bağlantı proxy'ye değil, doğrulanmış hedef IP'ye açılır (tam urllib3 zinciri)."""
+        self._dns({'public.example': [_PUBLIC_IP]})
+        with patch.dict(os.environ, self._PROXY_ENV), \
+             patch('Tarama.services.safe_http.urllib3_connection.create_connection',
+                   side_effect=ConnectionRefusedError) as mock_connect:
+            with self.assertRaises(requests.ConnectionError):
+                safe_session().get('http://public.example/', timeout=3)
+        self.assertEqual([c.args[0] for c in mock_connect.call_args_list], [(_PUBLIC_IP, 80)])
+
+    def test_scanner_traffic_ignores_environment_proxy(self):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        self._transport({'https://public.example/': (200, {}, '<html></html>')})
+        with patch.dict(os.environ, self._PROXY_ENV):
+            CmsScanner().scan('https://public.example/')
+        for call in HTTPAdapter.send.call_args_list:
+            self.assertEqual(call.kwargs.get('proxies'), {})
+
+
+class SafeSessionRedirectSemanticsTest(_SafeHttpTestBase):
+    """J: 301/302/303/307/308 — SafeSession, requests'in kendi yönlendirme davranışıyla
+    (ezbere değil, aynı senaryoda gerçek requests.Session çalıştırılarak) karşılaştırılır."""
+
+    _START = 'https://a.example/start'
+
+    def _record_hops(self, status: int, client_call) -> list:
+        hops = []
+
+        def start(request):
+            hops.append((request.method, request.body))
+            return (status, {'Location': '/next'}, '')
+
+        def nxt(request):
+            hops.append((request.method, request.body))
+            return (200, {}, 'ok')
+
+        self._transport({self._START: start, 'https://a.example/next': nxt})
+        client_call()
+        return hops
+
+    def _hops(self, client, status: int, method: str) -> list:
+        data = {'k': 'v'} if method in ('POST', 'PUT') else None
+        return self._record_hops(
+            status, lambda: client.request(method, self._START, data=data, allow_redirects=True))
+
+    def test_matches_requests_for_all_redirect_codes_and_methods(self):
+        self._dns({'a.example': [_PUBLIC_IP]})
+        reference = requests.Session()
+        reference.trust_env = False
+        for status in (301, 302, 303, 307, 308):
+            for method in ('GET', 'POST', 'PUT', 'HEAD'):
+                with self.subTest(status=status, method=method):
+                    expected = self._hops(reference, status, method)
+                    actual = self._hops(safe_session(), status, method)
+                    self.assertEqual(actual, expected)
+
+    def test_post_redirect_semantics_explicit(self):
+        """POST için beklenen davranış açıkça da doğrulanır."""
+        self._dns({'a.example': [_PUBLIC_IP]})
+        expected = {
+            301: ('GET', None), 302: ('GET', None), 303: ('GET', None),
+            307: ('POST', 'k=v'), 308: ('POST', 'k=v'),
+        }
+        for status, second_hop in expected.items():
+            with self.subTest(status=status):
+                hops = self._hops(safe_session(), status, 'POST')
+                self.assertEqual(hops[0], ('POST', 'k=v'))
+                self.assertEqual(hops[1], second_hop)
+
+    def test_put_301_keeps_method_but_drops_body_like_requests(self):
+        self._dns({'a.example': [_PUBLIC_IP]})
+        hops = self._hops(safe_session(), 301, 'PUT')
+        self.assertEqual(hops[1], ('PUT', None))
+
+    def test_every_redirect_code_still_validates_hop(self):
+        self._dns({'a.example': [_PUBLIC_IP]})
+        for status in (301, 302, 303, 307, 308):
+            with self.subTest(status=status):
+                transport = self._transport({self._START: (status, {'Location': 'http://10.0.0.1/'}, '')})
+                with self.assertRaises(OutboundRequestBlocked):
+                    safe_session().post(self._START, data={'k': 'v'})
+                self.assertNotIn('10.0.0.1', transport.hosts())

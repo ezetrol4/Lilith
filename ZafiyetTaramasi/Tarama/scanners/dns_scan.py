@@ -9,6 +9,7 @@ import dns.rdatatype
 import dns.name
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.safe_socket import OutboundConnectionBlocked, check_public_address
 
 
 _OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
@@ -310,10 +311,23 @@ class DnsScanner(Scanner):
         if not ns_records:
             return
 
+        tested = False
         for ns_raw in ns_records[:3]:  # İlk 3 NS'i dene
             ns_host = ns_raw.rstrip(".")
             try:
                 ns_ip = socket.gethostbyname(ns_host)
+                # NS adresi hedefin DNS yanıtından gelir — güvenilmez girdidir. AXFR
+                # yalnızca doğrulanmış IP literal'ine yapılır (yeniden çözümleme yok).
+                ns_ip = check_public_address(ns_ip)
+            except OutboundConnectionBlocked:
+                continue
+            except Exception:
+                # Çözümleme hatası mevcut davranışla aynı şekilde "denendi" sayılır
+                tested = True
+                continue
+
+            tested = True
+            try:
                 zone  = dns.zone.from_xfr(dns.query.xfr(ns_ip, domain, timeout=3))
                 if zone:
                     names = [str(n) for n in zone.nodes.keys()][:10]
@@ -337,6 +351,11 @@ class DnsScanner(Scanner):
                 # farklı istisna tipi üretebilir — herhangi biri sadece "bu nameserver
                 # AXFR'ı reddetti/desteklemiyor" anlamına gelir, sıradaki NS'e geçilir.
                 continue
+
+        if not tested:
+            # Tüm NS adresleri SSRF politikasınca reddedildi — hiçbir AXFR denenmedi,
+            # bu yüzden "engellendi / doğru yapılandırma" iddiasında bulunulmaz.
+            return
 
         result.findings.append(Finding(
             severity=Severity.INFO,

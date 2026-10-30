@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.safe_http import OUTBOUND_BLOCKED_MESSAGE
+from ..services.safe_socket import OutboundConnectionBlocked, connect_validated
 
 
 _OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
@@ -94,8 +96,10 @@ class PortScanner(Scanner):
     # --- Tek port tarama ---
 
     def _probe(self, host: str, port: int) -> tuple[int, bool, str]:
+        # OutboundConnectionBlocked bilinçli olarak yakalanmaz — engellenen hedef
+        # "port kapalı" olarak raporlanmamalı (bkz. scan()).
         try:
-            with socket.create_connection((host, port), timeout=self.timeout) as sock:
+            with connect_validated(host, port, timeout=self.timeout) as sock:
                 if port in _HTTPS_PORTS:
                     banner = self._grab_https_banner(host, sock, port)
                 else:
@@ -133,13 +137,24 @@ class PortScanner(Scanner):
 
         open_results:   dict[int, bool] = {}
         banner_results: dict[int, str]  = {}
+        blocked = False
 
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             futures = {executor.submit(self._probe, host, port): port for port in _SCAN_PORTS}
             for future in as_completed(futures):
-                port, is_open, banner = future.result()
+                try:
+                    port, is_open, banner = future.result()
+                except OutboundConnectionBlocked:
+                    blocked = True
+                    continue
                 open_results[port]   = is_open
                 banner_results[port] = banner
+
+        if blocked:
+            # Host tarama sırasında engelli bir adrese çözümlendi (ör. DNS rebinding) —
+            # port sonuçları güvenilir değildir ve iç ağa ait olabilir; raporlanmaz.
+            result.error = OUTBOUND_BLOCKED_MESSAGE
+            return result
 
         for port in _SCAN_PORTS:
             service, open_severity, description = _PORT_INFO[port]

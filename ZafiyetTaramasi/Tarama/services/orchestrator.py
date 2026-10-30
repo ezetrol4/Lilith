@@ -16,8 +16,19 @@ from ..scanners.integrity import IntegrityScanner
 from ..scanners.error_disclosure import ErrorDisclosureScanner
 from ..scanners.cmd import CmdInjectionScanner
 from ..scanners.nosql import NoSqlInjectionScanner
+from .safe_http import OUTBOUND_BLOCKED_MESSAGE, track_blocked_requests
 
 logger = logging.getLogger(__name__)
+
+
+def _run_scanner(scanner, target: str) -> ScanResult:
+    """Scanner'ı çalıştırır; SSRF politikası bir isteği engellediği için oluşan hatayı
+    sabit, sanitize edilmiş mesaja çevirir (iç IP/host detayı API'ye sızmaz)."""
+    with track_blocked_requests() as tracker:
+        result = scanner.scan(target)
+    if tracker.blocked and result.error:
+        result.error = OUTBOUND_BLOCKED_MESSAGE
+    return result
 
 
 @dataclass
@@ -58,7 +69,7 @@ def run_full_scan(target: str) -> ScanReport:
 
     results: dict[str, ScanResult] = {}
     with ThreadPoolExecutor(max_workers=len(scanners)) as executor:
-        futures = {executor.submit(s.scan, target): name for name, s in scanners.items()}
+        futures = {executor.submit(_run_scanner, s, target): name for name, s in scanners.items()}
         for future in as_completed(futures):
             name = futures[future]
             try:
