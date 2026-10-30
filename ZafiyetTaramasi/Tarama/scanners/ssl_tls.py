@@ -4,6 +4,8 @@ import time
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.safe_http import OUTBOUND_BLOCKED_MESSAGE
+from ..services.safe_socket import OutboundConnectionBlocked, connect_validated
 
 
 _OWASP_CRYPTO = "A02:2021 - Cryptographic Failures"
@@ -37,7 +39,7 @@ class SslScanner(Scanner):
         # HTTP hedefinde 443'ü dene
         if parsed.scheme == "http":
             try:
-                socket.create_connection((host, 443), timeout=self.timeout).close()
+                connect_validated(host, 443, timeout=self.timeout).close()
                 result.findings.append(Finding(
                     severity=Severity.LOW,
                     title="HTTPS mevcut ama kullanılmıyor",
@@ -50,6 +52,10 @@ class SslScanner(Scanner):
                     owasp=_OWASP_CRYPTO,
                     recommendation="Serve the site over HTTPS by default and redirect HTTP requests to HTTPS.",
                 ))
+            except OutboundConnectionBlocked:
+                # Engellenen hedef "HTTPS desteklenmiyor" bulgusuna dönüşmemeli
+                result.error = OUTBOUND_BLOCKED_MESSAGE
+                return result
             except (socket.timeout, ConnectionRefusedError, OSError):
                 result.findings.append(Finding(
                     severity=Severity.HIGH,
@@ -72,10 +78,14 @@ class SslScanner(Scanner):
             ctx = ssl.create_default_context()
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
-            with socket.create_connection((host, port), timeout=self.timeout) as raw_sock:
+            # TCP doğrulanmış IP'ye açılır; SNI orijinal hostname ile gönderilir
+            with connect_validated(host, port, timeout=self.timeout) as raw_sock:
                 with ctx.wrap_socket(raw_sock, server_hostname=host) as ssl_sock:
                     protocol          = ssl_sock.version() or "Bilinmiyor"
                     cipher_name, _, cipher_bits = ssl_sock.cipher()
+        except OutboundConnectionBlocked:
+            result.error = OUTBOUND_BLOCKED_MESSAGE
+            return result
         except (socket.timeout, ConnectionRefusedError, OSError) as e:
             result.error = f"SSL bağlantısı başarısız: {e}"
             return result
@@ -153,7 +163,8 @@ class SslScanner(Scanner):
         # --- Aşama 2: Sertifika doğrulama + ayrıntılar ---
         try:
             ctx2 = ssl.create_default_context()
-            with socket.create_connection((host, port), timeout=self.timeout) as raw_sock:
+            # Sertifika/hostname doğrulaması orijinal hostname ile yapılır (zayıflatılmadı)
+            with connect_validated(host, port, timeout=self.timeout) as raw_sock:
                 with ctx2.wrap_socket(raw_sock, server_hostname=host) as ssl_sock:
                     cert = ssl_sock.getpeercert()
             self._analyze_cert(cert, result)

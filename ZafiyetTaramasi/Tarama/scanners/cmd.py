@@ -14,6 +14,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.safe_http import SafeSession, safe_session
 
 
 _OWASP_INJECTION = "A03:2021 - Injection"
@@ -111,10 +112,10 @@ class CmdInjectionScanner(Scanner):
         self.max_forms           = max_forms
         self.max_fields_per_form = max_fields_per_form
 
-    def _make_session(self) -> requests.Session:
+    def _make_session(self) -> SafeSession:
         if self._external_session:
-            return self._external_session
-        s = requests.Session()
+            return safe_session(self._external_session)
+        s = safe_session()
         s.headers["User-Agent"] = _USER_AGENT
         return s
 

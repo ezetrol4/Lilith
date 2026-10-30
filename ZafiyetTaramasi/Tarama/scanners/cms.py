@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.safe_http import SafeSession, safe_session
 
 
 _USER_AGENT = (
@@ -108,8 +109,8 @@ class CmsScanner(Scanner):
     def __init__(self, timeout: float = 10.0):
         self.timeout = timeout
 
-    def _make_session(self) -> requests.Session:
-        s = requests.Session()
+    def _make_session(self) -> SafeSession:
+        s = safe_session()
         s.headers["User-Agent"] = _USER_AGENT
         return s
 

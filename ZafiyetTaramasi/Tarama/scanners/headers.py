@@ -1,9 +1,9 @@
 import re
-import urllib.request
-import urllib.error
+import requests
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.safe_http import safe_session
 
 
 _OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
@@ -85,25 +85,28 @@ class HeaderScanner(Scanner):
         result = ScanResult(scanner="headers", target=target)
         is_https = urlparse(target).scheme == "https"
         try:
-            response = urllib.request.urlopen(target, timeout=self.timeout)
-            self._analyze(result, response.info(), target, is_https)
-        except urllib.error.HTTPError as e:
-            # 4xx/5xx yanıtlarında header'lar hâlâ okunabilir — analizi sürdür
-            self._analyze(result, e.headers, target, is_https)
+            # urllib yerine SSRF korumalı istemci: yönlendirme hedefleri de doğrulanır
+            response = safe_session().get(target, timeout=self.timeout)
+        except requests.RequestException as e:
+            result.error = f"Bağlantı hatası: {e}"
+            return result
+        except Exception as e:
+            result.error = str(e)
+            return result
+
+        self._analyze(result, response.headers, target, is_https)
+        if not 200 <= response.status_code < 300:
+            # 4xx/5xx yanıtlarında header'lar hâlâ okunabilir — analiz sürdürüldü
             result.findings.append(Finding(
                 severity=Severity.LOW,
-                title=f"Sunucu HTTP {e.code} döndürdü",
-                evidence=str(e.reason),
+                title=f"Sunucu HTTP {response.status_code} döndürdü",
+                evidence=str(response.reason),
                 confidence=Confidence.HIGH,
                 status=FindingStatus.INFORMATIONAL,
                 description="The server responded with a non-2xx HTTP status; header analysis still "
                             "proceeded against this response.",
                 affected_url=target,
             ))
-        except urllib.error.URLError as e:
-            result.error = f"Bağlantı hatası: {e.reason}"
-        except Exception as e:
-            result.error = str(e)
 
         return result
 
