@@ -16,6 +16,7 @@ from ..scanners.integrity import IntegrityScanner
 from ..scanners.error_disclosure import ErrorDisclosureScanner
 from ..scanners.cmd import CmdInjectionScanner
 from ..scanners.nosql import NoSqlInjectionScanner
+from .evidence_redaction import redact_sensitive_url
 from .safe_http import OUTBOUND_BLOCKED_MESSAGE, track_blocked_requests
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,9 @@ def run_full_scan(target: str) -> ScanReport:
                 # Kasıtlı geniş sınır: bir scanner'ın beklenmeyen hatası tüm taramayı
                 # düşürmemeli. Tam detay yalnızca sunucu loguna yazılır; API'ye sızan
                 # mesaj sanitize edilir (stack trace / iç detay içermez).
-                logger.exception("Scanner '%s' failed unexpectedly for target %r", name, target)
+                # Hedef URL kullanıcı girdisidir ve user:password@ içerebilir
+                logger.exception("Scanner '%s' failed unexpectedly for target %r",
+                                 name, redact_sensitive_url(target))
                 results[name] = ScanResult(
                     scanner=name, target=target,
                     error=f"'{name}' tarayıcısı beklenmeyen bir hatayla karşılaştı.",

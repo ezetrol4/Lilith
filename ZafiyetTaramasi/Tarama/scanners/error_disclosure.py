@@ -12,6 +12,7 @@ import requests
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_sensitive_text, redact_then_truncate
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -132,12 +133,6 @@ _SWAGGER_SENSITIVE_RE = re.compile(
     r"(\"?(password|secret|api[_-]?key|access[_-]?token|private[_-]?key)\"?\s*:)", re.I,
 )
 
-# Evidence içinde maskelenecek olası secret kalıpları
-_SECRET_MASK_RE = re.compile(
-    r'(?i)(password|passwd|secret|api[_-]?key|access[_-]?token|authorization)'
-    r'(["\']?\s*[:=]\s*)["\']?([^\s"\',;]+)',
-)
-
 # Hata tetiklemek için kullanılacak sahte yollar
 _ERROR_TRIGGER_PATHS = [
     "/this-page-does-not-exist-xyz-12345",
@@ -147,7 +142,8 @@ _ERROR_TRIGGER_PATHS = [
 
 
 def _mask_secrets(text: str) -> str:
-    return _SECRET_MASK_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[MASKED]", text)
+    """Paylaşılan Lilith redaksiyonuna delege eder (tek işaret: [REDACTED])."""
+    return redact_sensitive_text(text)
 
 
 class ErrorDisclosureScanner(Scanner):
@@ -197,7 +193,7 @@ class ErrorDisclosureScanner(Scanner):
                 m = pattern.search(body)
                 if m and description not in seen_patterns:
                     seen_patterns.add(description)
-                    line = _mask_secrets(self._extract_line(body, m.start()))
+                    line = self._evidence_line(body, pattern)
 
                     if is_debug_mode:
                         result.findings.append(Finding(
@@ -242,6 +238,14 @@ class ErrorDisclosureScanner(Scanner):
                 affected_url=target,
             ))
 
+    def _evidence_line(self, body: str, pattern: re.Pattern) -> str:
+        """Kanıt satırı: gövde ÖNCE redakte edilir, satır SONRA çıkarılıp kırpılır —
+        stack trace / debug sayfasındaki DATABASE_URL, parola veya token sızmaz.
+        Tespit ham gövde üzerinde yapılır; bu yalnızca kanıt metnini üretir."""
+        redacted = redact_sensitive_text(body)
+        m = pattern.search(redacted)
+        return self._extract_line(redacted, m.start()) if m else ""
+
     def _extract_line(self, text: str, pos: int, max_len: int = 120) -> str:
         """Eşleşmenin bulunduğu satırı döner."""
         start = text.rfind("\n", 0, pos) + 1
@@ -271,7 +275,8 @@ class ErrorDisclosureScanner(Scanner):
             status_note = {200: "erişilebilir", 401: "auth gerekiyor", 403: "yasaklı"}
             snippet = ""
             if res.status_code == 200 and res.text:
-                snippet = " | İçerik: " + _mask_secrets(res.text[:150].replace("\n", " ").strip()) + "…"
+                # Önce redaksiyon, sonra kırpma (actuator/env gibi uçlar gizli değer döndürebilir)
+                snippet = " | İçerik: " + redact_then_truncate(res.text, 150).replace("\n", " ").strip() + "…"
 
             if res.status_code != 200:
                 # Uç var ama erişim kontrolü çalışıyor — bu güvenli davranış, zayıflık değil

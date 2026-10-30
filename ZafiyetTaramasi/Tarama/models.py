@@ -1,5 +1,7 @@
 from django.db import models
 
+from .services.evidence_redaction import redact_sensitive_text, redact_sensitive_url
+
 # CRITICAL -> INFO gerçek risk sırasını temsil eder. ScanFinding.severity düz bir
 # CharField olduğundan alfabetik sıralama YANLIŞ sıra üretir (CRITICAL, HIGH, INFO,
 # LOW, MEDIUM) — bu yüzden API çıktısı için ayrı bir rank kullanılır.
@@ -14,6 +16,8 @@ class ScanJob(models.Model):
         ('FAILED', 'Başarısız'),
     ]
 
+    # Güvenli görüntüleme URL'si (redact_sensitive_url) — tarama için kullanılan ham ağ
+    # URL'si burada SAKLANMAZ (bkz. services/scan_runner.start_scan).
     target = models.URLField(max_length=2048)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING')
     error = models.TextField(blank=True)
@@ -27,7 +31,7 @@ class ScanJob(models.Model):
         ordering = ['-created_at', '-id']
 
     def __str__(self):
-        return f"[{self.status}] {self.target} ({self.created_at:%Y-%m-%d %H:%M})"
+        return f"[{self.status}] {redact_sensitive_url(self.target)} ({self.created_at:%Y-%m-%d %H:%M})"
 
     @property
     def duration_seconds(self):
@@ -71,11 +75,13 @@ class ScanFinding(models.Model):
             "scanner": self.scanner,
             "severity": self.severity,
             "title": self.title,
-            "evidence": self.evidence,
+            # API sınırında defense-in-depth: P0-2 öncesinde ham olarak kaydedilmiş
+            # tarihsel kayıtlar dahil hiçbir kanıt gizli değeri API'ye taşımaz.
+            "evidence": redact_sensitive_text(self.evidence),
             "confidence": self.confidence or None,
             "status": self.status or None,
             "description": self.description or None,
-            "affected_url": self.affected_url or None,
+            "affected_url": redact_sensitive_url(self.affected_url) or None,
             "parameter": self.parameter or None,
             "owasp": self.owasp or None,
             "cwe": self.cwe or None,

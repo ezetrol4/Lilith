@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from ..services.evidence_redaction import redact_sensitive_text, redact_sensitive_url
+
 
 class Severity(Enum):
     INFO = "INFO"
@@ -43,6 +45,12 @@ class Finding:
     mitre: Optional[str] = None
     recommendation: Optional[str] = None
 
+    def __post_init__(self):
+        # Defense-in-depth: hangi scanner üretirse üretsin, hedef kaynaklı kanıttaki
+        # gizli değerler redakte edilir. Bu, scanner'ların ham parçayı kırpmadan ÖNCE
+        # redakte etme zorunluluğunun yerine geçmez (kırpma bağlamı koparabilir).
+        self.evidence = redact_sensitive_text(self.evidence)
+
     def to_dict(self) -> dict:
         return {
             "severity": self.severity.value,
@@ -51,7 +59,8 @@ class Finding:
             "confidence": self.confidence.value if self.confidence else None,
             "status": self.status.value if self.status else None,
             "description": self.description,
-            "affected_url": self.affected_url,
+            # Serileştirme sınırı: nesnedeki URL değişmez, dışarıya güvenli URL çıkar
+            "affected_url": redact_sensitive_url(self.affected_url),
             "parameter": self.parameter,
             "owasp": self.owasp,
             "cwe": self.cwe,
