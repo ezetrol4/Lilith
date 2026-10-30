@@ -17,7 +17,8 @@
         <p class="landing__subtitle">Web Security Assessment Framework</p>
       </div>
 
-      <form class="landing__form" id="targetForm" autocomplete="off">
+      <!-- method="post": JS devre dışı kalsa bile hedef asla sorgu dizesine (URL'ye) konmaz -->
+      <form class="landing__form" id="targetForm" method="post" autocomplete="off">
         <div>
           <label class="landing__label" for="urlInput">Target</label>
           <input
@@ -62,6 +63,23 @@
         $error.text('').removeClass('is-visible');
       }
 
+      function getCookie(name) {
+        var parts = document.cookie ? document.cookie.split(';') : [];
+        for (var i = 0; i < parts.length; i++) {
+          var cookie = parts[i].trim();
+          if (cookie.substring(0, name.length + 1) === (name + '=')) {
+            return decodeURIComponent(cookie.substring(name.length + 1));
+          }
+        }
+        return null;
+      }
+
+      function resetButton() {
+        $button.prop('disabled', false).removeClass('is-loading');
+        $button.find('.btn-label-loading').hide();
+        $button.find('.btn-label-idle').show();
+      }
+
       $input.on('input', clearError);
 
       $form.on('submit', function (e) {
@@ -79,7 +97,25 @@
         $button.find('.btn-label-idle').hide();
         $button.find('.btn-label-loading').show();
 
-        window.location.href = '/Ana/?url=' + encodeURIComponent(value);
+        // Ham hedef (kimlik bilgisi/token içerebilir) YALNIZCA istek gövdesinde gönderilir:
+        // tarayıcı URL'sine, geçmişe, localStorage/sessionStorage'a veya cookie'ye
+        // yazılmaz. Gezinme yalnızca sunucunun döndürdüğü scan_id ile yapılır.
+        $.ajax({
+          url: '/api/scan/',
+          method: 'POST',
+          data: { url_param: value },
+          dataType: 'json',
+          beforeSend: function (xhr) { xhr.setRequestHeader('X-CSRFToken', getCookie('csrftoken')); },
+          success: function (res) {
+            $input.val('');  // geri gezinmede form alanında ham hedef kalmasın
+            window.location.assign('/Ana/?scan_id=' + encodeURIComponent(res.job_id));
+          },
+          error: function (xhr) {
+            var message = (xhr.responseJSON && xhr.responseJSON.error) || 'Unable to start the assessment.';
+            showError(message);
+            resetButton();
+          }
+        });
       });
     });
   </script>

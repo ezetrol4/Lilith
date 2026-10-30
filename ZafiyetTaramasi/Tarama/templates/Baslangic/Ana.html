@@ -327,25 +327,12 @@
 
   <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
   <script>
-    var targetUrl = "{{ target_url|escapejs }}";
-    if (!targetUrl) { window.location.href = '/index'; }
+    // Dashboard yalnızca scan_id ve kaydedilmiş GÜVENLİ hedefi bilir — ham hedef bu
+    // sayfaya hiç ulaşmaz (tarama landing sayfasında, istek gövdesiyle başlatılır).
+    var scanId = {{ scan_id }};
+    var targetDisplayUrl = "{{ target_display_url|escapejs }}";
 
     // --- helpers ---------------------------------------------------------
-
-    function getCookie(name) {
-      var cookieValue = null;
-      if (document.cookie && document.cookie !== '') {
-        var cookies = document.cookie.split(';');
-        for (var i = 0; i < cookies.length; i++) {
-          var cookie = cookies[i].trim();
-          if (cookie.substring(0, name.length + 1) === (name + '=')) {
-            cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
-            break;
-          }
-        }
-      }
-      return cookieValue;
-    }
 
     function escHtml(s) {
       return String(s)
@@ -427,7 +414,7 @@
       );
     }
 
-    $('#topbarTarget').text(targetUrl).attr('title', targetUrl);
+    $('#topbarTarget').text(targetDisplayUrl).attr('title', targetDisplayUrl);
 
     // --- overview -----------------------------------------------------------
 
@@ -952,24 +939,9 @@
     }
 
     $(document).ready(function () {
-      var csrftoken = getCookie('csrftoken');
-
-      $.ajax({
-        url: '/api/scan/',
-        method: 'POST',
-        data: { url_param: targetUrl },
-        dataType: 'json',
-        beforeSend: function (xhr) { xhr.setRequestHeader('X-CSRFToken', csrftoken); },
-        success: function (res) {
-          setScanState(res.status);
-          pollScan(res.job_id);
-        },
-        error: function () {
-          $('#overviewEmpty').hide();
-          $('#overviewErrorBody').text('Unable to start the assessment.');
-          $('#overviewError').show();
-        }
-      });
+      // Tarama landing sayfasında oluşturuldu; burada yalnızca mevcut iş izlenir.
+      // Sayfa yenilemesi yeni tarama başlatmaz, aynı işi yeniden sorgular.
+      pollScan(scanId);
     });
   </script>
 

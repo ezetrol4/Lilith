@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_then_truncate
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -79,8 +80,13 @@ _ADMIN_PATHS = [
 
 
 def _text_snippet(html: str, max_len: int = 250) -> str:
-    """HTML'den tag'leri temizler ve ilk anlamlı metni döner."""
-    clean = re.sub(r'<[^>]+>', ' ', html)
+    """HTML'den tag'leri temizler ve ilk anlamlı metni döner.
+
+    Hedef dosya içeriği (.env, config, SQL dump) gerçek gizli değerler içerebilir:
+    redaksiyon satır yapısı korunurken ve HER kırpmadan önce yapılır.
+    """
+    clean = redact_then_truncate(html, 64 * 1024)
+    clean = re.sub(r'<[^>]+>', ' ', clean)
     clean = ' '.join(clean.split())
     return clean[:max_len] + ("…" if len(clean) > max_len else "")
 

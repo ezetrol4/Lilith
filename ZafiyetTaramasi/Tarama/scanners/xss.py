@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -304,6 +305,9 @@ def _detect_context(probe: str, body: str) -> str:
 
 def _extract_snippet(body: str, marker: str, width: int = 80) -> str:
     """Marker etrafındaki ~80 karakterlik bağlam kesitini döner."""
+    # Kanıt penceresi kesilmeden ÖNCE tüm gövde redakte edilir (yalnızca kanıt metni;
+    # tespit ham gövde üzerinde yapılır)
+    body = redact_sensitive_text(body)
     idx = body.find(marker)
     if idx == -1:
         return ""

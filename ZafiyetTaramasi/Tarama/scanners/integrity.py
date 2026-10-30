@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_then_truncate
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -305,7 +306,8 @@ class IntegrityScanner(Scanner):
             if not r or r.status_code != 200 or len(r.content) < 20:
                 continue
 
-            snippet = r.text[:200].replace("\n", " ").strip()
+            # debug.log / manifest gizli değer içerebilir — kırpmadan ÖNCE redakte edilir
+            snippet = redact_then_truncate(r.text, 200).replace("\n", " ").strip()
 
             if is_log:
                 result.findings.append(Finding(

@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -99,6 +100,9 @@ def _has_nosql_error(body: str) -> str | None:
 
 
 def _extract_snippet(body: str, marker: str, width: int = 150) -> str:
+    # Kanıt penceresi kesilmeden ÖNCE tüm gövde redakte edilir (yalnızca kanıt metni;
+    # tespit ham gövde üzerinde yapılır)
+    body = redact_sensitive_text(body)
     idx = body.lower().find(marker.lower())
     if idx == -1:
         return ""

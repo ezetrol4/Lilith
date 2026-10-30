@@ -1,4 +1,5 @@
 import json
+import logging
 import socket
 import ssl
 from unittest.mock import MagicMock, patch
@@ -3477,7 +3478,8 @@ class SensitiveDataLeakageTest(TestCase):
         line = 'Fatal error: password=SuperSecret123 in /var/www/app.py on line 10'
         masked = _mask_secrets(line)
         self.assertNotIn('SuperSecret123', masked)
-        self.assertIn('[MASKED]', masked)
+        # P0-2: tek, tutarlı redaksiyon işareti ([MASKED] yerine)
+        self.assertIn('[REDACTED]', masked)
 
     def test_serialized_finding_never_contains_fake_secret_markers(self):
         """Uçtan uca: tipik hassas değer kalıpları serialize edilmiş bir Finding içinde asla görünmemeli."""
@@ -4435,3 +4437,807 @@ class SafeSessionRedirectSemanticsTest(_SafeHttpTestBase):
                 with self.assertRaises(OutboundRequestBlocked):
                     safe_session().post(self._START, data={'k': 'v'})
                 self.assertNotIn('10.0.0.1', transport.hosts())
+
+
+# ---------------------------------------------------------------------------
+# P0-2: Hassas kanıt redaksiyonu (services/evidence_redaction.py)
+# Tüm değerler SAHTEDİR.
+# ---------------------------------------------------------------------------
+
+from .services.evidence_redaction import REDACTED, redact_sensitive_text, redact_then_truncate
+
+
+class EvidenceRedactionPatternTest(TestCase):
+    """A–P: yüksek güvenli gizli değer bağlamları redakte edilir, bağlam korunur."""
+
+    def assertRedacted(self, text: str, secret: str, keep: tuple = ()):
+        out = redact_sensitive_text(text)
+        self.assertNotIn(secret, out)
+        self.assertIn(REDACTED, out)
+        for fragment in keep:
+            self.assertIn(fragment, out)
+        return out
+
+    def test_a_db_password_key_value_preserves_other_lines(self):
+        out = self.assertRedacted(
+            'DB_HOST=db.internal\nDB_USER=app\nDB_PASSWORD=FakePass_A1\nDEBUG=True',
+            'FakePass_A1', keep=('DB_HOST=db.internal', 'DB_USER=app', 'DEBUG=True'))
+        self.assertIn('DB_PASSWORD=[REDACTED]', out)
+
+    def test_b_lowercase_and_variant_password_keys(self):
+        for text, secret in (('password=FakePass_B1', 'FakePass_B1'),
+                             ('passwd=FakePass_B2', 'FakePass_B2'),
+                             ('PWD=FakePass_B3', 'FakePass_B3'),
+                             ('DATABASE_PASSWORD=FakePass_B4', 'FakePass_B4'),
+                             ('MAIL_PASS=FakePass_B5', 'FakePass_B5')):
+            with self.subTest(text=text):
+                self.assertRedacted(text, secret)
+
+    def test_c_secret_key_variants(self):
+        for text, secret in (('SECRET_KEY=FakeSecret_C1', 'FakeSecret_C1'),
+                             ('DJANGO_SECRET_KEY=FakeSecret_C2', 'FakeSecret_C2'),
+                             ('SECRET=FakeSecret_C3', 'FakeSecret_C3'),
+                             ('CLIENT_SECRET=FakeSecret_C4', 'FakeSecret_C4'),
+                             ('AWS_SECRET_ACCESS_KEY=FakeSecret_C5', 'FakeSecret_C5')):
+            with self.subTest(text=text):
+                self.assertRedacted(text, secret)
+
+    def test_d_api_key_and_token_variants(self):
+        for text, secret in (('API_KEY=FakeKey_D1', 'FakeKey_D1'),
+                             ('APIKEY=FakeKey_D2', 'FakeKey_D2'),
+                             ('api-key: FakeKey_D3', 'FakeKey_D3'),
+                             ('TOKEN=FakeTok_D4', 'FakeTok_D4'),
+                             ('ACCESS_TOKEN=FakeTok_D5', 'FakeTok_D5'),
+                             ('REFRESH_TOKEN=FakeTok_D6', 'FakeTok_D6'),
+                             ('PRIVATE_KEY=FakeKey_D7', 'FakeKey_D7')):
+            with self.subTest(text=text):
+                self.assertRedacted(text, secret)
+
+    def test_e_bearer_token(self):
+        self.assertRedacted('Authorization: Bearer FakeBearer_E1abcdefghij', 'FakeBearer_E1',
+                            keep=('Authorization: Bearer [REDACTED]',))
+        self.assertRedacted('sent header Bearer FakeBearer9E2abcdefghijk', 'FakeBearer9E2')
+
+    def test_f_basic_and_proxy_authorization(self):
+        self.assertRedacted('Authorization: Basic RmFrZVVzZXI6RmFrZVBhc3M=', 'RmFrZVVzZXI6RmFrZVBhc3M=',
+                            keep=('Authorization: Basic [REDACTED]',))
+        self.assertRedacted('Proxy-Authorization: Basic RmFrZVByb3h5', 'RmFrZVByb3h5',
+                            keep=('Proxy-Authorization: Basic',))
+
+    def test_g_json_password_field(self):
+        out = self.assertRedacted('{"user": "app", "password": "FakeJson_G1", "host": "db"}', 'FakeJson_G1',
+                                  keep=('"user": "app"', '"host": "db"'))
+        self.assertIn('"password": "[REDACTED]"', out)
+
+    def test_h_yaml_password_field(self):
+        self.assertRedacted('database:\n  user: app\n  password: FakeYaml_H1\n  host: db', 'FakeYaml_H1',
+                            keep=('user: app', 'host: db', 'password: [REDACTED]'))
+
+    def test_i_ini_config_password(self):
+        self.assertRedacted('[database]\npassword = FakeIni_I1\nport = 5432', 'FakeIni_I1',
+                            keep=('[database]', 'port = 5432', 'password = [REDACTED]'))
+
+    def test_j_connection_string_password(self):
+        out = self.assertRedacted('Server=db;User ID=sa;Password=FakeConn_J1;Database=app;', 'FakeConn_J1',
+                                  keep=('Server=db', 'User ID=sa', 'Database=app'))
+        self.assertIn('Password=[REDACTED];', out)
+        self.assertRedacted('Driver={x};Pwd=FakeConn_J2;', 'FakeConn_J2')
+
+    def test_k_credential_bearing_url(self):
+        out = self.assertRedacted('https://admin:FakeUrl_K1@example.com/', 'FakeUrl_K1')
+        self.assertEqual(out, 'https://admin:[REDACTED]@example.com/')
+        out = self.assertRedacted('DATABASE_URL=postgres://app:FakeUrl_K2@db.internal:5432/app', 'FakeUrl_K2')
+        self.assertIn('postgres://app:[REDACTED]@db.internal:5432/app', out)
+
+    def test_l_pem_private_key_body(self):
+        for label in ('PRIVATE KEY', 'RSA PRIVATE KEY', 'EC PRIVATE KEY', 'OPENSSH PRIVATE KEY'):
+            with self.subTest(label=label):
+                text = f'-----BEGIN {label}-----\nMIIFakeKeyBodyL1\nFakeKeyBodyL2==\n-----END {label}-----'
+                out = redact_sensitive_text(text)
+                self.assertEqual(out, f'-----BEGIN {label}-----\n[REDACTED]\n-----END {label}-----')
+
+    def test_l_unterminated_private_key_body(self):
+        out = redact_sensitive_text('-----BEGIN PRIVATE KEY-----\nMIIFakeTruncatedBody')
+        self.assertNotIn('MIIFakeTruncatedBody', out)
+        self.assertEqual(out, '-----BEGIN PRIVATE KEY-----\n[REDACTED]')
+
+    def test_l_public_certificate_unchanged(self):
+        cert = '-----BEGIN CERTIFICATE-----\nMIIPublicCertBody\n-----END CERTIFICATE-----'
+        self.assertEqual(redact_sensitive_text(cert), cert)
+        pub = '-----BEGIN PUBLIC KEY-----\nMIIPublicKeyBody\n-----END PUBLIC KEY-----'
+        self.assertEqual(redact_sensitive_text(pub), pub)
+
+    def test_m_benign_prose_word_password_not_destroyed(self):
+        for text in ('Please enter your password to continue. The password field is required.',
+                     'Forgot your password? Reset it from the account page.',
+                     '<label for="password">Password:</label>',
+                     'Bearer token required',
+                     'Basic authentication is enabled',
+                     'Access-Control-Allow-Origin: * ile Access-Control-Allow-Credentials: true',
+                     '["username", "password", "email"]',
+                     'Password::Hash::make($value)'):
+            with self.subTest(text=text):
+                self.assertEqual(redact_sensitive_text(text), text)
+
+    def test_n_hashes_and_identifiers_unchanged(self):
+        for text in ('sha256: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+                     'md5 d41d8cd98f00b204e9800998ecf8427e',
+                     '550e8400-e29b-41d4-a716-446655440000',
+                     'commit 2884ebf1c0ffee'):
+            with self.subTest(text=text):
+                self.assertEqual(redact_sensitive_text(text), text)
+
+    def test_n_security_signals_unchanged(self):
+        """SQL/XSS/CMD kanıtı, durum kodları, CWE/OWASP, yollar ve IP'ler korunur."""
+        for text in ("You have an error in your SQL syntax near ''' OR '1'='1' --'",
+                     "URL: https://example.com/login | Alan: q | Payload: ' OR SLEEP(4)-- -",
+                     '<img src=x onerror=alert(1)>', '" onmouseover="alert(1)',
+                     'root:x:0:0:root:/root:/bin/bash uid=0(root) gid=0(root)',
+                     'HTTP 500 | CWE-89 | A03:2021 - Injection | /api/v1/users | 10.0.0.1',
+                     'Strict-Transport-Security: max-age=31536000; includeSubDomains',
+                     'Kullanıcı: admin | Parola: [gizlendi — test edilen bilinen varsayılan değer]'):
+            with self.subTest(text=text):
+                self.assertEqual(redact_sensitive_text(text), text)
+
+    def test_o_existing_marker_unchanged(self):
+        for text in ('[REDACTED]', 'DB_PASSWORD=[REDACTED]', '"password": "[REDACTED]"',
+                     'Authorization: Bearer [REDACTED]', 'https://u:[REDACTED]@h/'):
+            with self.subTest(text=text):
+                self.assertEqual(redact_sensitive_text(text), text)
+
+    def test_p_idempotent(self):
+        samples = [
+            'DB_PASSWORD=FakeIdem1\nAPI_KEY=FakeIdem2',
+            'Authorization: Bearer FakeIdem3abcdefghijklm',
+            '{"secret": "FakeIdem4", "token": "FakeIdem5"}',
+            'Set-Cookie: sessionid=FakeIdem6; Path=/; Secure; HttpOnly',
+            '-----BEGIN RSA PRIVATE KEY-----\nFakeIdem7\n-----END RSA PRIVATE KEY-----',
+            '-----BEGIN PRIVATE KEY-----\nFakeIdem8',
+            'mysql://root:FakeIdem9@db/app', 'Plain text without secrets.',
+        ]
+        for text in samples:
+            with self.subTest(text=text):
+                once = redact_sensitive_text(text)
+                self.assertEqual(redact_sensitive_text(once), once)
+
+    def test_non_string_values_pass_through(self):
+        self.assertIsNone(redact_sensitive_text(None))
+        self.assertEqual(redact_sensitive_text(''), '')
+
+    def test_cookie_values_redacted_attributes_kept(self):
+        out = redact_sensitive_text('Set-Cookie: sessionid=FakeCookie1; Path=/; Secure; HttpOnly; SameSite=Lax')
+        self.assertEqual(out, 'Set-Cookie: sessionid=[REDACTED]; Path=/; Secure; HttpOnly; SameSite=Lax')
+        out = redact_sensitive_text('Cookie: sessionid=FakeCookie2; csrftoken=FakeCookie3; theme=dark')
+        self.assertNotIn('FakeCookie2', out)
+        self.assertNotIn('FakeCookie3', out)
+        self.assertIn('sessionid=[REDACTED]', out)
+
+    def test_session_and_csrf_key_values(self):
+        for text, secret in (('PHPSESSID=FakeSess1', 'FakeSess1'), ('csrftoken=FakeCsrf1', 'FakeCsrf1'),
+                             ('session_id: FakeSess2', 'FakeSess2'), ('?token=FakeQuery1&page=2', 'FakeQuery1')):
+            with self.subTest(text=text):
+                self.assertRedacted(text, secret)
+
+    def test_php_define_sql_and_phpinfo_contexts(self):
+        self.assertRedacted("define('DB_PASSWORD', 'FakeDefine1');", 'FakeDefine1', keep=("define('DB_PASSWORD'",))
+        self.assertRedacted("$db_password = \"FakePhpVar1\";", 'FakePhpVar1')
+        self.assertRedacted("INSERT INTO settings VALUES ('smtp_password','FakeSqlKv1');", 'FakeSqlKv1')
+        self.assertRedacted("CREATE USER 'app'@'%' IDENTIFIED BY 'FakeIdent1';", 'FakeIdent1')
+        self.assertRedacted('<td class="e">DB_PASSWORD </td><td class="v">FakePhpinfo1 </td>', 'FakePhpinfo1')
+
+    def test_high_confidence_token_formats(self):
+        jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJmYWtlLXVzZXIifQ.FakeJwtSignature123'
+        for token in (jwt, 'ghp_' + 'F' * 36, 'github_pat_' + 'F' * 30, 'AKIA' + 'FAKEFAKEFAKEFAKE',
+                      'xoxb-0000-FakeSlackTok', 'sk_live_' + 'F' * 24, 'AIza' + 'F' * 35,
+                      'sk-ant-' + 'F' * 30, '$2y$10$' + 'F' * 53):
+            with self.subTest(token=token[:12]):
+                out = redact_sensitive_text(f'value {token} end')
+                self.assertNotIn(token, out)
+                self.assertEqual(out, 'value [REDACTED] end')
+
+
+class EvidenceRedactionBeforeTruncationTest(TestCase):
+    """V: redaksiyon kırpmadan ÖNCE yapılır — aksi halde kesim bağlamı koparıp sızdırır."""
+
+    def test_prefix_truncation_cannot_split_token(self):
+        token = 'ghp_' + 'FakeTruncTok' * 3
+        text = 'x' * 180 + ' ' + token
+        naive = redact_sensitive_text(text[:200])          # yanlış sıra
+        self.assertIn(token[:15], naive)                    # eski sıra sızdırırdı
+        safe = redact_then_truncate(text, 200)              # doğru sıra
+        self.assertNotIn(token[:15], safe)
+        self.assertLessEqual(len(safe), 200)
+
+    def test_window_start_cannot_cut_key_from_value(self):
+        """Pencere başlangıcı anahtarın ortasına düşse bile değer sızmaz (cmd snippet)."""
+        from .scanners.cmd import _extract_snippet
+        body = 'MY_DB_PASSWORD=FakeWindowSecret root:x:0:0:root:/root:/bin/bash'
+        naive_window = body[body.find('root:x') - 20:]
+        self.assertIn('FakeWindowSecret', redact_sensitive_text(naive_window))  # eski sıra sızdırırdı
+        self.assertNotIn('FakeWindowSecret', _extract_snippet(body, 'root:x:0:0'))
+
+    def test_all_window_snippet_helpers_redact_first(self):
+        from .scanners.cmd import _extract_snippet as cmd_snippet
+        from .scanners.nosql import _extract_snippet as nosql_snippet
+        from .scanners.sql import _extract_error_snippet
+        from .scanners.xss import _extract_snippet as xss_snippet
+        body = 'ERR password=FakeHelperPw mongoerror you have an error in your sql syntax <svg onload=1>'
+        self.assertNotIn('FakeHelperPw', cmd_snippet(body, 'mongoerror'))
+        self.assertNotIn('FakeHelperPw', nosql_snippet(body, 'mongoerror'))
+        self.assertNotIn('FakeHelperPw', _extract_error_snippet(body))
+        self.assertNotIn('FakeHelperPw', xss_snippet(body, '<svg onload=1>'))
+        self.assertIn('<svg onload=1>', xss_snippet(body, '<svg onload=1>'))
+
+    def test_pem_block_longer_than_snippet(self):
+        text = '-----BEGIN PRIVATE KEY-----\n' + 'FakeLongKeyMaterial' * 40 + '\n-----END PRIVATE KEY-----'
+        out = redact_then_truncate(text, 60)
+        self.assertNotIn('FakeLongKeyMaterial', out)
+
+
+class _ScannerResponseMixin:
+    @staticmethod
+    def _resp(text='', status=200):
+        r = MagicMock()
+        r.text = text
+        r.content = text.encode()
+        r.status_code = status
+        r.url = 'https://example.com/'
+        r.headers = {}
+        return r
+
+    def _route(self, MockSession, routes: dict, default_status=404):
+        def get(url, **kwargs):
+            for suffix, (text, status) in routes.items():
+                if url.endswith(suffix):
+                    return self._resp(text, status)
+            return self._resp('', default_status)
+        MockSession.return_value.get.side_effect = get
+
+
+class CmsEvidenceRedactionTest(_ScannerResponseMixin, TestCase):
+    """Q, R, S: açık hassas dosyalar hâlâ bulgu üretir ama gerçek değerler saklanmaz."""
+
+    def _finding_for(self, MockSession, path, content):
+        self._route(MockSession, {'example.com/': ('<html></html>', 200), path: (content, 200)})
+        result = CmsScanner().scan('https://example.com/')
+        return next(f for f in result.findings if f.title == f'Hassas dosya erişilebilir: {path}')
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_q_env_file_evidence_contains_no_secret(self, MockSession):
+        env = ('APP_NAME=lilith-lab\nDB_HOST=db.internal\nDB_PASSWORD=FakeEnvPass_Q1\n'
+               'SECRET_KEY=FakeEnvSecret_Q2\nAWS_SECRET_ACCESS_KEY=FakeEnvAws_Q3\nDEBUG=True\n')
+        finding = self._finding_for(MockSession, '/.env', env)
+        for secret in ('FakeEnvPass_Q1', 'FakeEnvSecret_Q2', 'FakeEnvAws_Q3'):
+            self.assertNotIn(secret, finding.evidence)
+        self.assertIn('DB_PASSWORD=[REDACTED]', finding.evidence)
+        self.assertIn('DB_HOST=db.internal', finding.evidence)
+        # Bulgu semantiği değişmedi
+        self.assertEqual(finding.severity, Severity.CRITICAL)
+        self.assertEqual(finding.status, FindingStatus.CONFIRMED)
+        self.assertEqual(finding.affected_url, 'https://example.com/.env')
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_r_config_file_evidence_contains_no_secret(self, MockSession):
+        config = ("<?php\ndefine('DB_NAME', 'app');\ndefine('DB_PASSWORD', 'FakeConfig_R1');\n"
+                  "$db_password = \"FakeConfig_R2\";\n$api_key = 'FakeConfig_R3';\n")
+        finding = self._finding_for(MockSession, '/config.php', config)
+        for secret in ('FakeConfig_R1', 'FakeConfig_R2', 'FakeConfig_R3'):
+            self.assertNotIn(secret, finding.evidence)
+        self.assertIn("define('DB_NAME', 'app')", finding.evidence)
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_s_sql_dump_evidence_contains_no_credential_values(self, MockSession):
+        bcrypt = '$2y$10$' + 'FakeBcryptHashValueForLilithTestsOnly0123456789abcdef'[:53]
+        dump = ("-- MySQL dump\nCREATE TABLE users (id int, pw varchar(60));\n"
+                f"INSERT INTO users VALUES (1,'admin','{bcrypt}');\n"
+                "INSERT INTO settings VALUES ('smtp_password','FakeDump_S1');\n"
+                "CREATE USER 'app'@'%' IDENTIFIED BY 'FakeDump_S2';\n")
+        finding = self._finding_for(MockSession, '/backup.sql', dump)
+        for secret in (bcrypt, 'FakeDump_S1', 'FakeDump_S2'):
+            self.assertNotIn(secret, finding.evidence)
+        self.assertIn('CREATE TABLE users', finding.evidence)
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_git_config_remote_credentials_redacted(self, MockSession):
+        git = ('[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n'
+               '\turl = https://deploy:FakeGitToken_1@git.example.com/org/repo.git\n')
+        finding = self._finding_for(MockSession, '/.git/config', git)
+        self.assertNotIn('FakeGitToken_1', finding.evidence)
+        self.assertIn('git.example.com/org/repo.git', finding.evidence)
+
+
+class IntegrityEvidenceRedactionTest(_ScannerResponseMixin, TestCase):
+
+    @patch('Tarama.scanners.integrity.requests.Session')
+    def test_t_debug_log_evidence_contains_no_secret(self, MockSession):
+        log = ('[31-Oct-2026] PHP Warning: db connect failed password=FakeLog_T1\n'
+               'Authorization: Bearer FakeLogBearer_T2abcdefgh\n'
+               'DATABASE_URL=postgres://app:FakeLog_T3@db/app\n')
+        self._route(MockSession, {'example.com/': ('<html></html>', 200), '/wp-content/debug.log': (log, 200)})
+        result = IntegrityScanner().scan('https://example.com/')
+        finding = next(f for f in result.findings if 'debug.log' in f.title)
+        for secret in ('FakeLog_T1', 'FakeLog_T2', 'FakeLog_T3'):
+            self.assertNotIn(secret, finding.evidence)
+        self.assertIn('db connect failed', finding.evidence)
+        self.assertIn('Authorization: Bearer [REDACTED]', finding.evidence)
+        self.assertEqual(finding.status, FindingStatus.CONFIRMED)
+
+
+class ErrorDisclosureEvidenceRedactionTest(_ScannerResponseMixin, TestCase):
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_u_stack_trace_line_secret_redacted(self, MockSession):
+        # Gizli değerler, kanıt olarak alınan eşleşme satırının KENDİSİNDEdir
+        trace = ('<html><body>\nFatal error: Uncaught PDOException password=FakeTrace_U1 '
+                 'dsn=mysql://app:FakeTrace_U2@db/app in /var/www/app/db.php on line 12\n</body></html>')
+        self._route(MockSession, {'/this-page-does-not-exist-xyz-12345': (trace, 500)})
+        result = ErrorDisclosureScanner().scan('https://example.com/')
+        traces = [f for f in result.findings if f.title == 'Application Stack Trace Disclosure']
+        self.assertTrue(traces)
+        for finding in traces:
+            self.assertNotIn('FakeTrace_U1', finding.evidence)
+            self.assertNotIn('FakeTrace_U2', finding.evidence)
+            self.assertIn('db.php', finding.evidence)
+            self.assertIn('Fatal error', finding.evidence)
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_u_monitoring_endpoint_snippet_redacted_before_truncation(self, MockSession):
+        env = '{"activeProfiles":[],"spring.datasource.password":"FakeActuator_U3","x":"' + 'y' * 300 + '"}'
+        self._route(MockSession, {'/actuator/env': (env, 200)})
+        result = ErrorDisclosureScanner().scan('https://example.com/')
+        finding = next(f for f in result.findings if f.title == 'İzleme endpoint\'i bulundu: /actuator/env')
+        self.assertNotIn('FakeActuator_U3', finding.evidence)
+        self.assertIn('[REDACTED]', finding.evidence)
+        self.assertEqual(finding.severity, Severity.CRITICAL)
+
+
+class EvidenceBoundaryTest(TestCase):
+    """W, X, Y, Z: kalıcılık, API, frontend ve log sınırları."""
+
+    _SECRET = 'FakeBoundarySecret_W1'
+
+    def test_finding_construction_redacts_only_evidence(self):
+        finding = Finding(
+            severity=Severity.HIGH, title='password=TitleIsNotTouched',
+            evidence=f'DB_PASSWORD={self._SECRET}',
+            affected_url='https://example.com/?token=UrlIsNotTouched',
+            recommendation='Rotate SECRET_KEY=RecommendationIsNotTouched',
+        )
+        self.assertEqual(finding.evidence, 'DB_PASSWORD=[REDACTED]')
+        self.assertEqual(finding.title, 'password=TitleIsNotTouched')
+        self.assertEqual(finding.affected_url, 'https://example.com/?token=UrlIsNotTouched')
+        self.assertEqual(finding.recommendation, 'Rotate SECRET_KEY=RecommendationIsNotTouched')
+        self.assertNotIn(self._SECRET, json.dumps(finding.to_dict()))
+
+    def test_w_persisted_scan_finding_contains_no_secret(self):
+        from .services.scan_runner import _save_report
+        from .services.orchestrator import ScanReport
+
+        job = ScanJob.objects.create(target='https://example.com', status='RUNNING')
+        finding = Finding(severity=Severity.HIGH, title='x', evidence='placeholder')
+        finding.evidence = f'api_key={self._SECRET}'   # oluşturulduktan sonra değiştirilmiş
+
+        def empty(name):
+            return ScanResult(scanner=name, target='https://example.com')
+
+        report = ScanReport(
+            target='https://example.com', headers=empty('headers'), ports=empty('ports'),
+            sql=empty('sql'), xss=empty('xss'), ssl=empty('ssl'), dns=empty('dns'),
+            cms=ScanResult(scanner='cms', target='https://example.com', findings=[finding]),
+            access_control=empty('access_control'), auth=empty('auth'), integrity=empty('integrity'),
+            error_disclosure=empty('error_disclosure'), cmd=empty('cmd'),
+            nosql=ScanResult(scanner='nosql', target='https://example.com',
+                             error=f'Connection failed: https://u:{self._SECRET}@db.example.com/'),
+        )
+        _save_report(job, report)
+
+        for row in job.findings.all():
+            self.assertNotIn(self._SECRET, row.evidence)
+        self.assertEqual(job.findings.get(scanner='cms').evidence, 'api_key=[REDACTED]')
+
+    def test_x_api_serialization_redacts_even_historical_raw_rows(self):
+        """P0-2 öncesinde ham kaydedilmiş bir satır API'den gizli değer taşımaz."""
+        job = ScanJob.objects.create(target='https://example.com', status='DONE')
+        ScanFinding.objects.create(job=job, scanner='cms', severity='CRITICAL', title='Hassas dosya',
+                                   evidence=f'DB_PASSWORD={self._SECRET}', status='CONFIRMED')
+        with _public_dns():
+            res = Client().get(f'/api/scan/{job.id}/')
+        self.assertEqual(res.status_code, 200)
+        self.assertNotIn(self._SECRET, res.content.decode())
+        self.assertIn('DB_PASSWORD=[REDACTED]', res.json()['findings'][0]['evidence'])
+
+    @patch('Tarama.views.XssScanner')
+    @patch('Tarama.views.SqlInjectionScanner')
+    def test_y_frontend_responses_contain_no_secret(self, MockSql, MockXss):
+        secret_result = lambda name: ScanResult(
+            scanner=name, target='https://example.com',
+            findings=[Finding(severity=Severity.HIGH, title='t', evidence=f'token={self._SECRET}')],
+            error=f'Bağlantı hatası: https://u:{self._SECRET}@example.com/',
+        )
+        MockXss.return_value.scan.return_value = secret_result('xss')
+        MockSql.return_value.scan.return_value = secret_result('sql')
+        client = Client()
+        with _public_dns():
+            xss = client.post('/Ana/check_xss_scan', {'url_param': 'https://example.com'})
+            sql = client.post('/Ana/check_sql_scan', {'url_param': 'https://example.com'})
+        for res in (xss, sql):
+            self.assertEqual(res.status_code, 200)
+            self.assertNotIn(self._SECRET, res.content.decode())
+
+    def test_z_orchestrator_log_does_not_contain_target_password(self):
+        from .services.orchestrator import run_full_scan
+        OrchestratorTest._patch_all_scanners(self, {'cms': RuntimeError('boom')})
+        with self.assertLogs('Tarama.services.orchestrator', level='ERROR') as logs:
+            run_full_scan(f'https://admin:{self._SECRET}@example.com/')
+        rendered = '\n'.join(logging.Formatter().format(r) for r in logs.records)
+        self.assertNotIn(self._SECRET, rendered)
+        self.assertIn('admin:[REDACTED]@example.com', rendered)
+
+    @patch('Tarama.services.scan_runner.run_full_scan', side_effect=RuntimeError('boom'))
+    def test_z_scan_runner_log_does_not_contain_target_password(self, _mock):
+        from .services.scan_runner import _run_in_background
+        job = ScanJob.objects.create(target='https://example.com', status='PENDING')
+        with self.assertLogs('Tarama.services.scan_runner', level='ERROR') as logs:
+            _run_in_background(job.id, f'https://admin:{self._SECRET}@example.com/')
+        rendered = '\n'.join(logging.Formatter().format(r) for r in logs.records)
+        self.assertNotIn(self._SECRET, rendered)
+
+
+# ---------------------------------------------------------------------------
+# P0-2 (devam): kimlik bilgisi taşıyan URL'ler — ağ URL'si ≠ güvenli görüntüleme URL'si
+# Tüm değerler SAHTEDİR.
+# ---------------------------------------------------------------------------
+
+from .services.evidence_redaction import redact_sensitive_url
+
+_RAW_TARGET = 'https://admin:FakeUrlPw_1@example.com/api?token=FakeUrlTok_2&lang=en&api_key=FakeUrlKey_3'
+_SAFE_TARGET = 'https://admin:[REDACTED]@example.com/api?token=[REDACTED]&lang=en&api_key=[REDACTED]'
+_URL_SECRETS = ('FakeUrlPw_1', 'FakeUrlTok_2', 'FakeUrlKey_3')
+
+
+class SensitiveUrlRedactionTest(TestCase):
+
+    def test_spec_example(self):
+        self.assertEqual(redact_sensitive_url('https://admin:secret@example.com/api?token=abc&lang=en'),
+                         'https://admin:[REDACTED]@example.com/api?token=[REDACTED]&lang=en')
+
+    def test_userinfo_password_redacted_username_host_port_path_kept(self):
+        self.assertEqual(redact_sensitive_url('https://deploy:FakePw@git.example.com:8443/org/repo.git'),
+                         'https://deploy:[REDACTED]@git.example.com:8443/org/repo.git')
+        self.assertEqual(redact_sensitive_url('redis://:FakePw@cache.example.com:6379/0'),
+                         'redis://:[REDACTED]@cache.example.com:6379/0')
+
+    def test_token_query_parameters_redacted(self):
+        for name in ('token', 'access_token', 'refresh_token', 'id_token', 'auth_token', 'TOKEN'):
+            with self.subTest(param=name):
+                out = redact_sensitive_url(f'https://example.com/cb?{name}=FakeTok&page=2')
+                self.assertEqual(out, f'https://example.com/cb?{name}=[REDACTED]&page=2')
+
+    def test_api_key_and_secret_query_parameters_redacted(self):
+        for name in ('api_key', 'apikey', 'api-key', 'client_secret', 'password', 'X-Amz-Signature',
+                     'X-Amz-Security-Token', 'sig', 'signature'):
+            with self.subTest(param=name):
+                out = redact_sensitive_url(f'https://example.com/f?{name}=FakeVal&v=1')
+                self.assertNotIn('FakeVal', out)
+                self.assertIn('v=1', out)
+
+    def test_benign_query_parameters_intact(self):
+        for url in ('https://example.com/search?q=password&keyword=token&page=2&sort=name',
+                    'https://example.com/?id=1&lang=en&utm_source=x',
+                    'https://example.com/path/to/page.php?cat=1#section-2',
+                    'https://example.com', 'https://example.com/?'):
+            with self.subTest(url=url):
+                self.assertEqual(redact_sensitive_url(url), url)
+
+    def test_fragment_token_redacted(self):
+        self.assertEqual(redact_sensitive_url('https://example.com/cb#access_token=FakeFrag&state=xyz'),
+                         'https://example.com/cb#access_token=[REDACTED]&state=xyz')
+
+    def test_known_token_username_redacted(self):
+        url = 'https://ghp_' + 'F' * 36 + '@github.com/org/repo'
+        self.assertEqual(redact_sensitive_url(url), 'https://[REDACTED]@github.com/org/repo')
+
+    def test_idempotent_and_non_string(self):
+        for url in (_RAW_TARGET, _SAFE_TARGET, 'https://example.com/?sig=x', 'https://[bad'):
+            with self.subTest(url=url):
+                once = redact_sensitive_url(url)
+                self.assertEqual(redact_sensitive_url(once), once)
+        self.assertIsNone(redact_sensitive_url(None))
+        self.assertEqual(redact_sensitive_url(''), '')
+        self.assertEqual(redact_sensitive_url(_RAW_TARGET), _SAFE_TARGET)
+
+    def test_text_redaction_applies_url_policy_to_embedded_urls(self):
+        text = 'Request failed for https://s3.example.com/f?X-Amz-Signature=FakeSigText&X-Amz-Expires=60'
+        out = redact_sensitive_text(text)
+        self.assertNotIn('FakeSigText', out)
+        self.assertIn('X-Amz-Expires=60', out)
+        self.assertEqual(redact_sensitive_text(out), out)
+
+    def test_evidence_redaction_remains_idempotent_with_urls(self):
+        evidence = (f'URL: {_RAW_TARGET} | DB_PASSWORD=FakeIdemPw | '
+                    'Payload: <script>alert(1)</script> | https://example.com/?q=1')
+        once = redact_sensitive_text(evidence)
+        self.assertEqual(redact_sensitive_text(once), once)
+        for secret in _URL_SECRETS + ('FakeIdemPw',):
+            self.assertNotIn(secret, once)
+        self.assertIn('<script>alert(1)</script>', once)
+        self.assertIn('https://example.com/?q=1', once)
+
+
+class TargetUrlBoundaryTest(TestCase):
+    """Ağ URL'si scanner'a değişmeden gider; DB/API/geçmiş/frontend/log güvenli URL görür."""
+
+    def _assert_no_url_secret(self, text: str):
+        for secret in _URL_SECRETS:
+            self.assertNotIn(secret, text)
+
+    @patch('Tarama.services.scan_runner.threading.Thread')
+    def test_create_scan_persists_safe_url_but_thread_gets_raw_url(self, MockThread):
+        with _public_dns():
+            res = Client().post('/api/scan/', {'url_param': _RAW_TARGET})
+        self.assertEqual(res.status_code, 201)
+        self._assert_no_url_secret(res.content.decode())
+
+        job = ScanJob.objects.get(id=res.json()['job_id'])
+        self.assertEqual(job.target, _SAFE_TARGET)
+        self.assertEqual(MockThread.call_args.kwargs['args'], (job.id, _RAW_TARGET))
+        self._assert_no_url_secret(str(job))
+
+    @patch('Tarama.services.scan_runner.run_full_scan')
+    def test_background_job_scans_original_unmodified_url(self, mock_run_full_scan):
+        from .services.orchestrator import ScanReport
+        from .services.scan_runner import _run_in_background
+
+        def empty(name):
+            return ScanResult(scanner=name, target=_RAW_TARGET)
+        mock_run_full_scan.return_value = ScanReport(
+            target=_RAW_TARGET, headers=empty('headers'), ports=empty('ports'), sql=empty('sql'),
+            xss=empty('xss'), ssl=empty('ssl'), dns=empty('dns'), cms=empty('cms'),
+            access_control=empty('access_control'), auth=empty('auth'), integrity=empty('integrity'),
+            error_disclosure=empty('error_disclosure'), cmd=empty('cmd'), nosql=empty('nosql'),
+        )
+        job = ScanJob.objects.create(target=_SAFE_TARGET, status='PENDING')
+
+        _run_in_background(job.id, _RAW_TARGET)
+
+        mock_run_full_scan.assert_called_once_with(_RAW_TARGET)
+        job.refresh_from_db()
+        self.assertEqual(job.status, 'DONE')
+        self.assertEqual(job.target, _SAFE_TARGET)
+
+    @patch('Tarama.views.SqlInjectionScanner')
+    @patch('Tarama.views.HeaderScanner')
+    def test_single_scanner_endpoints_scan_raw_url_and_display_safe_url(self, MockHeaders, MockSql):
+        MockHeaders.return_value.scan.return_value = ScanResult(scanner='headers', target=_RAW_TARGET)
+        MockSql.return_value.scan.return_value = ScanResult(scanner='sql', target=_RAW_TARGET)
+        client = Client()
+        with _public_dns():
+            headers = client.post('/Ana/check_headers', {'url_param': _RAW_TARGET})
+            sql = client.post('/Ana/check_sql_scan', {'url_param': _RAW_TARGET})
+
+        MockHeaders.return_value.scan.assert_called_once_with(_RAW_TARGET)
+        MockSql.return_value.scan.assert_called_once_with(_RAW_TARGET)
+        self.assertEqual(headers.json()['url_param'], _SAFE_TARGET)
+        for res in (headers, sql):
+            self._assert_no_url_secret(res.content.decode())
+
+    def test_ana_page_never_receives_raw_target(self):
+        """P0-2 kapanışı: eski `/Ana/?url=<ham>` gezinmesi kaldırıldı — ham hedef sayfaya
+        hiç ulaşmaz; görüntüleme kaydedilmiş güvenli hedeften gelir (bkz. ScanIdNavigationTest)."""
+        res = Client().get('/Ana/', {'url': _RAW_TARGET})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(res['Location'], '/index')
+        self._assert_no_url_secret(res.content.decode())
+
+    def test_history_and_status_never_expose_url_credentials(self):
+        # P0-2 öncesinde ham kaydedilmiş tarihsel bir iş dahil
+        historical = ScanJob.objects.create(target=_RAW_TARGET, status='DONE')
+        ScanFinding.objects.create(job=historical, scanner='sql', severity='HIGH', title='t',
+                                   affected_url=_RAW_TARGET, evidence='e', status='POTENTIAL')
+        client = Client()
+        history = client.get('/api/scan/history/')
+        status = client.get(f'/api/scan/{historical.id}/')
+        for res in (history, status):
+            self.assertEqual(res.status_code, 200)
+            self._assert_no_url_secret(res.content.decode())
+        self.assertEqual(status.json()['target'], _SAFE_TARGET)
+        self.assertEqual(status.json()['findings'][0]['affected_url'], _SAFE_TARGET)
+
+    def test_affected_url_serialization_and_persistence_safe_object_unchanged(self):
+        from .services.scan_runner import _save_report
+        from .services.orchestrator import ScanReport
+
+        finding = Finding(severity=Severity.HIGH, title='t', evidence='e', affected_url=_RAW_TARGET)
+        self.assertEqual(finding.affected_url, _RAW_TARGET)                  # nesne değişmez
+        self.assertEqual(finding.to_dict()['affected_url'], _SAFE_TARGET)    # serileştirme güvenli
+
+        job = ScanJob.objects.create(target=_SAFE_TARGET, status='RUNNING')
+
+        def empty(name):
+            return ScanResult(scanner=name, target=_RAW_TARGET)
+        report = ScanReport(
+            target=_RAW_TARGET, headers=empty('headers'), ports=empty('ports'),
+            sql=ScanResult(scanner='sql', target=_RAW_TARGET, findings=[finding]),
+            xss=empty('xss'), ssl=empty('ssl'), dns=empty('dns'), cms=empty('cms'),
+            access_control=empty('access_control'), auth=empty('auth'), integrity=empty('integrity'),
+            error_disclosure=empty('error_disclosure'), cmd=empty('cmd'), nosql=empty('nosql'),
+        )
+        _save_report(job, report)
+        self.assertEqual(job.findings.get(scanner='sql').affected_url, _SAFE_TARGET)
+
+    def test_orchestrator_log_never_exposes_url_credentials(self):
+        from .services.orchestrator import run_full_scan
+        OrchestratorTest._patch_all_scanners(self, {'cms': RuntimeError('boom')})
+        with self.assertLogs('Tarama.services.orchestrator', level='ERROR') as logs:
+            run_full_scan(_RAW_TARGET)
+        rendered = '\n'.join(logging.Formatter().format(r) for r in logs.records)
+        self._assert_no_url_secret(rendered)
+        self.assertIn('lang=en', rendered)
+
+    @patch('Tarama.services.scan_runner.run_full_scan', side_effect=RuntimeError('boom'))
+    def test_scan_runner_log_never_exposes_url_credentials(self, _mock):
+        from .services.scan_runner import _run_in_background
+        job = ScanJob.objects.create(target=_SAFE_TARGET, status='PENDING')
+        with self.assertLogs('Tarama.services.scan_runner', level='ERROR') as logs:
+            _run_in_background(job.id, _RAW_TARGET)
+        rendered = '\n'.join(logging.Formatter().format(r) for r in logs.records)
+        self._assert_no_url_secret(rendered)
+
+
+# ---------------------------------------------------------------------------
+# P0-2 (kapanış): ham hedef asla tarayıcı URL'sine konmaz — gezinme yalnızca scan_id ile
+# Tüm değerler SAHTEDİR. Tarayıcı otomasyonu yok: landing/dashboard JS'si render edilmiş
+# şablon üzerinden, backend akışı gerçek view'lar üzerinden doğrulanır.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+
+class ScanIdNavigationTest(TestCase):
+
+    _BENIGN = 'https://example.com/search?q=test'
+
+    def _assert_no_secret(self, text: str):
+        for secret in _URL_SECRETS:
+            self.assertNotIn(secret, text)
+
+    def _landing_html(self) -> str:
+        res = Client().get('/index')
+        self.assertEqual(res.status_code, 200)
+        return res.content.decode()
+
+    @patch('Tarama.services.scan_runner.threading.Thread')
+    def _create_scan(self, url, MockThread):
+        """Landing JS'sinin yaptığı isteğin aynısı: hedef GÖVDEDE, POST /api/scan/."""
+        with _public_dns():
+            res = Client().post('/api/scan/', {'url_param': url})
+        return res, MockThread
+
+    # --- A, B, D, G, H: landing sayfası ---
+
+    def test_a_landing_never_builds_raw_url_navigation(self):
+        html = self._landing_html()
+        self.assertNotIn('/Ana/?url=', html)
+        self.assertNotIn('?url=', html)
+        self.assertIsNone(_re.search(r'location(\.href)?\s*=\s*[^;]*value', html),
+                          'Girilen değer gezinme URL\'sine konmamalı')
+
+    def test_b_landing_posts_raw_target_in_request_body(self):
+        html = self._landing_html()
+        self.assertRegex(html, r"url:\s*'/api/scan/'")
+        self.assertRegex(html, r"method:\s*'POST'")
+        self.assertRegex(html, r"data:\s*\{\s*url_param:\s*value\s*\}")
+        # JS devre dışıysa yerel form gönderimi de GET (sorgu dizesi) olmamalı
+        self.assertRegex(html, r'<form[^>]*id="targetForm"[^>]*method="post"')
+
+    def test_d_landing_navigates_with_scan_id_only(self):
+        html = self._landing_html()
+        navigations = _re.findall(r"location\.(?:assign|replace|href)\s*\(?\s*=?\s*([^;\n]+)", html)
+        self.assertEqual(len(navigations), 1)
+        self.assertIn("'/Ana/?scan_id=' + encodeURIComponent(res.job_id)", navigations[0])
+
+    # --- C, E, F, G, H: uçtan uca backend akışı ---
+
+    def test_c_e_f_g_h_credential_target_flow(self):
+        res, MockThread = self._create_scan(_RAW_TARGET)
+        self.assertEqual(res.status_code, 201)
+        body = res.json()
+        self.assertIsInstance(body['job_id'], int)                       # C
+        self._assert_no_secret(res.content.decode())
+
+        job_id = body['job_id']
+        self.assertEqual(MockThread.call_args.kwargs['args'], (job_id, _RAW_TARGET))   # F
+
+        browser_url = f'/Ana/?scan_id={job_id}'                           # landing'in gideceği URL
+        self._assert_no_secret(browser_url)                               # G, H
+        self.assertNotIn('admin:', browser_url)
+
+        page = Client().get(browser_url)
+        self.assertEqual(page.status_code, 200)
+        html = page.content.decode()
+        self._assert_no_secret(html)                                      # E
+        self.assertEqual(page.context['target_display_url'], _SAFE_TARGET)
+        self.assertIn(f'var scanId = {job_id};', html)
+        self.assertNotIn('/api/scan/\',\n        method: \'POST\'', html)  # dashboard tarama başlatmaz
+
+    def test_e_dashboard_display_comes_from_persisted_target_even_if_historically_raw(self):
+        job = ScanJob.objects.create(target=_RAW_TARGET, status='DONE')   # P0-2 öncesi ham kayıt
+        page = Client().get(f'/Ana/?scan_id={job.id}')
+        self.assertEqual(page.context['target_display_url'], _SAFE_TARGET)
+        self._assert_no_secret(page.content.decode())
+
+    def test_i_benign_target_flow_still_works(self):
+        res, MockThread = self._create_scan(self._BENIGN)
+        self.assertEqual(res.status_code, 201)
+        job_id = res.json()['job_id']
+        self.assertEqual(MockThread.call_args.kwargs['args'], (job_id, self._BENIGN))
+        self.assertEqual(ScanJob.objects.get(id=job_id).target, self._BENIGN)
+        page = Client().get(f'/Ana/?scan_id={job_id}')
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(page.context['target_display_url'], self._BENIGN)
+
+    def test_i_bare_hostname_is_still_normalized(self):
+        res, MockThread = self._create_scan('example.com')
+        self.assertEqual(MockThread.call_args.kwargs['args'][1], 'https://example.com')
+
+    def test_invalid_target_is_rejected_on_landing_without_navigation(self):
+        with _public_dns():
+            res = Client().post('/api/scan/', {'url_param': 'http://127.0.0.1/'})
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('error', res.json())
+        self.assertFalse(ScanJob.objects.exists())
+
+    def test_dashboard_reload_does_not_start_new_scan(self):
+        job = ScanJob.objects.create(target='https://example.com', status='RUNNING')
+        with patch('Tarama.services.scan_runner.threading.Thread') as MockThread:
+            Client().get(f'/Ana/?scan_id={job.id}')
+            Client().get(f'/Ana/?scan_id={job.id}')
+        MockThread.assert_not_called()
+        self.assertEqual(ScanJob.objects.count(), 1)
+
+    # --- J: tarayıcı/sunucu tarafında ikinci bir kopya yok ---
+
+    def test_j_no_client_or_session_persistence_of_raw_target(self):
+        landing = self._landing_html()
+        dashboard_job = ScanJob.objects.create(target=_SAFE_TARGET, status='DONE')
+        dashboard = Client().get(f'/Ana/?scan_id={dashboard_job.id}').content.decode()
+        for html in (landing, dashboard):
+            # API kullanımı aranır (yorumdaki "localStorage'a yazılmaz" ifadesi değil)
+            self.assertIsNone(_re.search(r'(?:local|session)Storage\s*[.\[]', html),
+                              'Web Storage kullanılmamalı')
+            self.assertIsNone(_re.search(r'document\.cookie\s*=(?!=)', html), 'cookie yazımı olmamalı')
+            self.assertNotIn('history.pushState', html)
+            self.assertNotIn('history.replaceState', html)
+
+        client = Client()
+        with _public_dns(), patch('Tarama.services.scan_runner.threading.Thread'):
+            res = client.post('/api/scan/', {'url_param': _RAW_TARGET})
+        for morsel in res.cookies.values():
+            self._assert_no_secret(morsel.value)
+        self.assertEqual(dict(client.session), {})                       # Django session'a yazılmadı
+        self._assert_no_secret(json.dumps(list(ScanJob.objects.values())[0], default=str))
+
+    # --- K: eski ?url= gezinmesi ---
+
+    def test_k_legacy_url_navigation_redirects_without_exposure(self):
+        with patch('Tarama.services.scan_runner.threading.Thread') as MockThread, \
+                self.assertNoLogs('Tarama', level='DEBUG'):
+            res = Client().get('/Ana/', {'url': _RAW_TARGET})
+        self.assertEqual(res.status_code, 302)
+        self.assertEqual(res['Location'], '/index')                      # hedef geri yansıtılmaz
+        self.assertEqual(res.content, b'')
+        MockThread.assert_not_called()                                    # GET tarama başlatmaz
+        self.assertFalse(ScanJob.objects.exists())
+
+    def test_k_invalid_or_unknown_scan_id_redirects(self):
+        for query in ({}, {'scan_id': 'abc'}, {'scan_id': '-1'}, {'scan_id': '²'},
+                      {'scan_id': '999999'}, {'scan_id': '1 OR 1=1'}):
+            with self.subTest(query=query):
+                res = Client().get('/Ana/', query)
+                self.assertEqual(res.status_code, 302)
+                self.assertEqual(res['Location'], '/index')
+
+    def test_dashboard_scan_id_is_rendered_as_integer_literal(self):
+        job = ScanJob.objects.create(target='https://example.com', status='DONE')
+        html = Client().get(f'/Ana/?scan_id={job.id}').content.decode()
+        self.assertRegex(html, rf'var scanId = {job.id};')
