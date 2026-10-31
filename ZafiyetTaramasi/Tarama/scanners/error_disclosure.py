@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
 from ..services.evidence_redaction import redact_sensitive_text, redact_then_truncate
+from ..services.path_baseline import PathBaseline, Relation
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -141,6 +142,14 @@ _ERROR_TRIGGER_PATHS = [
 ]
 
 
+# Kanıtta, yanıtın var olmayan yol baseline'ıyla ilişkisi
+_BASELINE_NOTE = {
+    Relation.DIFFERS_FROM_BASELINE: "Var olmayan yol baseline'ından farklı",
+    Relation.AMBIGUOUS:             "Var olmayan yol baseline'ı ile karşılaştırma belirsiz",
+    Relation.BASELINE_UNAVAILABLE:  "Var olmayan yol baseline'ı alınamadı",
+}
+
+
 def _mask_secrets(text: str) -> str:
     """Paylaşılan Lilith redaksiyonuna delege eder (tek işaret: [REDACTED])."""
     return redact_sensitive_text(text)
@@ -260,9 +269,13 @@ class ErrorDisclosureScanner(Scanner):
     def _check_monitoring_endpoints(self, session: requests.Session,
                                      base: str, result: ScanResult) -> None:
         found_any = False
+        # HTTP 200 kaynağın var olduğunu kanıtlamaz (SPA / catch-all / özel 404):
+        # hedefin var olmayan yol davranışı tarama başına bir kez ölçülür.
+        baseline = PathBaseline.build(session, base, self.timeout)
 
         for path, label, table_severity, keyword in _MONITORING_ENDPOINTS:
-            res = self._get(session, base + path)
+            url = base + path
+            res = self._get(session, url)
             if not res or res.status_code not in (200, 401, 403):
                 continue
 
@@ -270,6 +283,11 @@ class ErrorDisclosureScanner(Scanner):
             if keyword and res.status_code == 200:
                 if keyword.lower() not in res.text.lower():
                     continue
+
+            relation = baseline.classify(res, url, path)
+            if relation == Relation.MATCHES_BASELINE:
+                # Var olmayan bir yolun yanıtından ayırt edilemiyor — uç kanıtlanmadı
+                continue
 
             found_any = True
             status_note = {200: "erişilebilir", 401: "auth gerekiyor", 403: "yasaklı"}
@@ -327,15 +345,29 @@ class ErrorDisclosureScanner(Scanner):
             if path in _HEALTHLIKE_PATHS and len(res.text) < 200 and not _HEALTHLIKE_SUSPICIOUS_RE.search(res.text):
                 severity = Severity.INFO
 
+            # Uca özgü içerik işareti (keyword) yoksa tek kanıt, yanıtın var olmayan yol
+            # baseline'ından farklı olmasıdır — bu kanıtlanamıyorsa CONFIRMED değildir.
+            unverified = keyword is None and relation != Relation.DIFFERS_FROM_BASELINE
+            if severity == Severity.INFO:
+                status, confidence, description = FindingStatus.INFORMATIONAL, Confidence.HIGH, None
+            elif unverified:
+                status, confidence = FindingStatus.POTENTIAL, Confidence.LOW
+                description = ("This path returned HTTP 200, but the response could not be reliably "
+                               "distinguished from the application's response for nonexistent paths "
+                               "(soft-404 / catch-all behavior), and no endpoint-specific content marker "
+                               "was checked. Manual verification is required.")
+            else:
+                status, confidence = FindingStatus.CONFIRMED, Confidence.HIGH
+                description = ("This monitoring/management endpoint is publicly reachable and its response "
+                               "content indicates it exposes more than basic status information.")
+
             result.findings.append(Finding(
                 severity=severity,
                 title=f"İzleme endpoint'i bulundu: {path}",
-                evidence=f"{label} — HTTP 200{snippet}",
-                confidence=Confidence.HIGH,
-                status=FindingStatus.INFORMATIONAL if severity == Severity.INFO else FindingStatus.CONFIRMED,
-                description=None if severity == Severity.INFO else
-                            "This monitoring/management endpoint is publicly reachable and its response "
-                            "content indicates it exposes more than basic status information.",
+                evidence=f"{label} — HTTP 200 | {_BASELINE_NOTE[relation]}{snippet}",
+                confidence=confidence,
+                status=status,
+                description=description,
                 affected_url=base + path,
                 owasp=None if severity == Severity.INFO else _OWASP_MONITORING,
                 recommendation=None if severity == Severity.INFO else

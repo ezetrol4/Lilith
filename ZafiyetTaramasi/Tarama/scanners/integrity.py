@@ -7,6 +7,7 @@ Kontroller:
 - Dependency manifest dosyalarının erişilebilirliği
 - CSP nonce/hash olmayan inline <script> varlığı
 """
+import json
 import re
 import requests
 from urllib.parse import urlparse
@@ -14,6 +15,7 @@ from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
 from ..services.evidence_redaction import redact_then_truncate
+from ..services.path_baseline import PathBaseline, Relation
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -63,6 +65,53 @@ _DEPENDENCY_FILES = [
     ("/build.gradle",       "Gradle bağımlılıkları",                Severity.LOW,    False),
     ("/wp-content/debug.log", "WordPress hata logu",               Severity.MEDIUM, True),
 ]
+
+
+# İçerik doğrulama — HTTP 200 + boyut, istenen dosyanın döndüğünü kanıtlamaz
+# (SPA/catch-all her yola aynı HTML'i döndürebilir).
+_JSON_MANIFEST_KEYS: dict[str, frozenset] = {
+    "/package.json":      frozenset({"name", "version", "dependencies", "devDependencies", "scripts"}),
+    "/package-lock.json": frozenset({"lockfileVersion", "packages", "dependencies"}),
+    "/composer.json":     frozenset({"require", "require-dev", "autoload", "name"}),
+    "/composer.lock":     frozenset({"packages", "content-hash", "_readme"}),
+    "/Pipfile.lock":      frozenset({"_meta", "default", "develop"}),
+}
+_M = re.MULTILINE
+_TEXT_MANIFEST_MARKERS: dict[str, re.Pattern] = {
+    "/yarn.lock":        re.compile(r"yarn lockfile|^\s+(?:version|resolved|integrity)\s+\S", _M),
+    "/requirements.txt": re.compile(r"^\s*(?:[A-Za-z0-9][\w.\-]*(?:\[[^\]]*\])?\s*(?:==|>=|<=|~=|!=|>|<)\s*\S"
+                                    r"|-[re]\s+\S|--(?:index-url|extra-index-url)\s)", _M),
+    "/Pipfile":          re.compile(r"^\[(?:\[source\]|packages|dev-packages|requires)\]", _M),
+    "/Gemfile":          re.compile(r"^\s*(?:source\s+['\"]https?://|gem\s+['\"])", _M),
+    "/Gemfile.lock":     re.compile(r"^(?:GEM|DEPENDENCIES|PLATFORMS|BUNDLED WITH)\s*$", _M),
+    "/go.mod":           re.compile(r"^module\s+\S+", _M),
+    "/pom.xml":          re.compile(r"<project[\s>][\s\S]*<(?:artifactId|dependencies)>"),
+    "/build.gradle":     re.compile(r"^\s*(?:dependencies|plugins|repositories|android)\s*\{"
+                                    r"|(?:implementation|compile|api)\s+['\"]", _M),
+    "/wp-content/debug.log": re.compile(
+        r"^\[\d{2}-[A-Z][a-z]{2}-\d{4}[^\]]*\]|PHP (?:Warning|Notice|Fatal error|Deprecated|Parse error)"
+        r"|^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}", _M,
+    ),
+}
+
+
+def _looks_like_html_document(text: str) -> bool:
+    return text.lstrip()[:15].lower().startswith(("<!doctype html", "<html"))
+
+
+def _looks_like_requested_file(path: str, text: str) -> bool:
+    """Yanıtın istenen manifest/log dosyası olduğuna dair içerik kanıtı."""
+    if _looks_like_html_document(text):
+        return False
+    keys = _JSON_MANIFEST_KEYS.get(path)
+    if keys is not None:
+        try:
+            data = json.loads(text)
+        except ValueError:
+            return False
+        return isinstance(data, dict) and bool(keys & data.keys())
+    marker = _TEXT_MANIFEST_MARKERS.get(path)
+    return bool(marker and marker.search(text))
 
 
 def _extract_domain(url: str, base_domain: str) -> str | None:
@@ -301,13 +350,40 @@ class IntegrityScanner(Scanner):
 
     def _check_dependency_files(self, session: requests.Session,
                                   base: str, result: ScanResult) -> None:
+        # Tarama başına bir kez: hedefin var olmayan yol davranışı (soft-404 / catch-all)
+        baseline = PathBaseline.build(session, base, self.timeout)
+
         for path, description, severity, is_log in _DEPENDENCY_FILES:
-            r = self._get(session, base + path)
+            url = base + path
+            r = self._get(session, url)
             if not r or r.status_code != 200 or len(r.content) < 20:
+                continue
+
+            if baseline.classify(r, url, path) == Relation.MATCHES_BASELINE:
+                # Var olmayan bir yolun yanıtından ayırt edilemiyor — dosya kanıtlanmadı
                 continue
 
             # debug.log / manifest gizli değer içerebilir — kırpmadan ÖNCE redakte edilir
             snippet = redact_then_truncate(r.text, 200).replace("\n", " ").strip()
+
+            if not _looks_like_requested_file(path, r.text):
+                if not _looks_like_html_document(r.text):
+                    # Farklı bir yanıt ama istenen dosyaya benzemiyor — onaylanmaz
+                    result.findings.append(Finding(
+                        severity=Severity.LOW,
+                        title=f"Yol erişilebilir ama içerik doğrulanamadı: {path}",
+                        evidence=f"{description} | HTTP 200 | İçerik: {snippet}…",
+                        confidence=Confidence.LOW,
+                        status=FindingStatus.MANUAL_REVIEW,
+                        description=f"{path} returned HTTP 200 with content that differs from the "
+                                    "application's nonexistent-path response, but it does not match the "
+                                    f"expected structure of {description}. Manual verification is "
+                                    "recommended before treating this as an exposure.",
+                        affected_url=url,
+                        recommendation=f"Manually verify whether {path} genuinely exposes this file.",
+                    ))
+                # HTML sayfa (SPA/catch-all) istenen dosya değildir — bulgu üretilmez
+                continue
 
             if is_log:
                 result.findings.append(Finding(
