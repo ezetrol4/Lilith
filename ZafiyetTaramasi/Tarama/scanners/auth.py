@@ -324,7 +324,7 @@ class AuthScanner(Scanner):
                 f"wronguser_{i}_xyz", f"wrongpass_{i}_xyz",
             )
             res = self._submit(session, url, method, data)
-            if not res:
+            if res is None:  # 429/503 Response falsy'dir — aşağıdaki durum kontrolüne ulaşmalı
                 continue
 
             if res.status_code in (429, 503):

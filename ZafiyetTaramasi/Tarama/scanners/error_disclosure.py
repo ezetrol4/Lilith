@@ -194,7 +194,7 @@ class ErrorDisclosureScanner(Scanner):
         for path in _ERROR_TRIGGER_PATHS:
             url = base + path if path.startswith("/") else target + path
             res = self._get(session, url)
-            if not res:
+            if res is None:  # 4xx/5xx Response falsy'dir — hata sayfaları tam da bunlardır
                 continue
 
             body = res.text
@@ -276,7 +276,7 @@ class ErrorDisclosureScanner(Scanner):
         for path, label, table_severity, keyword in _MONITORING_ENDPOINTS:
             url = base + path
             res = self._get(session, url)
-            if not res or res.status_code not in (200, 401, 403):
+            if res is None or res.status_code not in (200, 401, 403):
                 continue
 
             # keyword varsa yanıt gövdesinde de kontrol et (false positive azalt)
