@@ -87,7 +87,7 @@ class AccessControlScanner(Scanner):
         is_https = parsed.scheme == "https"
 
         res = self._get(session, target)
-        if res:
+        if res is not None:  # 401/403 yanıtları da CORS/cookie başlığı taşır
             self._check_cors(res, target, result)
             self._check_dir_listing(res, target, result)
             self._check_cookies(res, target, is_https, result)
@@ -153,7 +153,7 @@ class AccessControlScanner(Scanner):
     def _check_cors_reflection(self, session: requests.Session, target: str, result: ScanResult) -> None:
         """Sunucunun keyfi bir Origin değerini doğrudan yansıtıp yansıtmadığını test eder."""
         res = self._get(session, target, headers={"Origin": _CORS_PROBE_ORIGIN})
-        if not res:
+        if res is None:
             return
 
         reflected = res.headers.get("Access-Control-Allow-Origin", "")

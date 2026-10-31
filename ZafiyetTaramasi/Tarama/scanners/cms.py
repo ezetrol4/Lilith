@@ -132,7 +132,7 @@ class CmsScanner(Scanner):
         session = self._make_session()
 
         res = self._get(session, target)
-        if not res:
+        if res is None:  # yanıt yok; 4xx/5xx ana sayfa da analiz edilir
             result.error = "Ana sayfa alınamadı"
             return result
 
@@ -218,9 +218,9 @@ class CmsScanner(Scanner):
                              baseline: PathBaseline) -> None:
         for path, description in _VERSION_PATHS:
             r = self._get(session, base + path)
-            if r and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
+            if r is not None and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
                 continue  # var olmayan yol yanıtından ayırt edilemiyor (soft-404 / catch-all)
-            if not r or r.status_code != 200 or len(r.content) < 100:
+            if r is None or r.status_code != 200 or len(r.content) < 100:
                 continue
             version = self._extract_version(r.text)
             snippet = _text_snippet(r.text, 200)
@@ -249,9 +249,9 @@ class CmsScanner(Scanner):
                                baseline: PathBaseline) -> None:
         for path, severity, description in _SENSITIVE_PATHS:
             r = self._get(session, base + path)
-            if r and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
+            if r is not None and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
                 continue  # var olmayan yol yanıtından ayırt edilemiyor (soft-404 / catch-all)
-            if not r or r.status_code != 200 or len(r.content) < 10:
+            if r is None or r.status_code != 200 or len(r.content) < 10:
                 continue
 
             snippet = _text_snippet(r.text, 300)
@@ -295,9 +295,9 @@ class CmsScanner(Scanner):
                            baseline: PathBaseline) -> None:
         for path, label in _ADMIN_PATHS:
             r = self._get(session, base + path)
-            if r and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
+            if r is not None and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
                 continue  # var olmayan yol yanıtından ayırt edilemiyor (soft-404 / catch-all)
-            if not r or r.status_code not in (200, 401, 403):
+            if r is None or r.status_code not in (200, 401, 403):
                 continue
             title_tag = _page_title(r.text)
             evidence = f"{label} — HTTP {r.status_code}"
@@ -334,7 +334,7 @@ class CmsScanner(Scanner):
     def _check_robots(self, session: requests.Session,
                        base: str, target: str, result: ScanResult) -> None:
         r = self._get(session, base + "/robots.txt")
-        if not r or r.status_code != 200:
+        if r is None or r.status_code != 200:
             return
         disallowed = [
             line.split(":", 1)[1].strip()

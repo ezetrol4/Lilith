@@ -158,7 +158,7 @@ class IntegrityScanner(Scanner):
             base += f":{parsed.port}"
 
         res = self._get(session, target)
-        if not res:
+        if res is None:  # yanıt yok; 4xx/5xx ana sayfa da analiz edilir
             result.error = "Ana sayfa alınamadı"
             return result
 
@@ -356,7 +356,7 @@ class IntegrityScanner(Scanner):
         for path, description, severity, is_log in _DEPENDENCY_FILES:
             url = base + path
             r = self._get(session, url)
-            if not r or r.status_code != 200 or len(r.content) < 20:
+            if r is None or r.status_code != 200 or len(r.content) < 20:
                 continue
 
             if baseline.classify(r, url, path) == Relation.MATCHES_BASELINE:

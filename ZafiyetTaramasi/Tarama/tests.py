@@ -63,6 +63,25 @@ def tearDownModule():
         tripwire.stop()
 
 
+def _http_response(status: int, text: str = '', url: str = 'https://example.com/',
+                   headers: dict | None = None) -> requests.Response:
+    """Gerçek requests.Response: bool(r) == r.ok — 4xx/5xx yanıtlar FALSY'dir.
+
+    Kalıcı olarak truthy olan MagicMock'ların gizlediği 'if not res' hatalarını
+    yakalamak için HTTP durum semantiği önemli olan testlerde kullanılır."""
+    from requests.structures import CaseInsensitiveDict
+    response = requests.Response()
+    response.status_code = status
+    response.reason = {200: 'OK', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found',
+                       429: 'Too Many Requests', 500: 'Internal Server Error',
+                       503: 'Service Unavailable'}.get(status, '')
+    response._content = text.encode()
+    response.encoding = 'utf-8'
+    response.url = url
+    response.headers = CaseInsensitiveDict(headers or {})
+    return response
+
+
 def _public_dns(ip: str = '93.184.216.34'):
     """getaddrinfo yerine: her host'u verilen public IP'ye çözer (gerçek DNS yok)."""
     def fake_getaddrinfo(host, port, *args, **kwargs):
@@ -2447,13 +2466,11 @@ class ErrorDisclosureScannerTest(TestCase):
     @patch('Tarama.scanners.error_disclosure.requests.Session')
     def test_django_debug_page_high(self, MockSession):
         instance = MockSession.return_value
-        res = MagicMock()
-        res.text = (
+        # Gerçek Response: HTTP 500 falsy'dir (MagicMock bu hatayı gizliyordu)
+        instance.get.return_value = _http_response(500, (
             '<html><body>Django Version: 4.2 | INSTALLED_APPS = [...] '
             'TemplateSyntaxError at /</body></html>'
-        )
-        res.status_code = 500
-        instance.get.return_value = res
+        ))
 
         result = ErrorDisclosureScanner().scan('https://example.com')
 
@@ -2466,14 +2483,11 @@ class ErrorDisclosureScannerTest(TestCase):
     @patch('Tarama.scanners.error_disclosure.requests.Session')
     def test_sanitized_stack_trace_is_medium(self, MockSession):
         instance = MockSession.return_value
-        res = MagicMock()
-        res.text = (
+        instance.get.return_value = _http_response(500, (
             'Traceback (most recent call last):\n'
             '  File "/app/views.py", line 42, in handler\n'
             '    raise ValueError("boom")\n'
-        )
-        res.status_code = 500
-        instance.get.return_value = res
+        ))
 
         result = ErrorDisclosureScanner().scan('https://example.com')
 
@@ -2485,10 +2499,7 @@ class ErrorDisclosureScannerTest(TestCase):
     @patch('Tarama.scanners.error_disclosure.requests.Session')
     def test_clean_error_page_info(self, MockSession):
         instance = MockSession.return_value
-        res = MagicMock()
-        res.text = '<html><body><h1>404 Not Found</h1></body></html>'
-        res.status_code = 404
-        instance.get.return_value = res
+        instance.get.return_value = _http_response(404, '<html><body><h1>404 Not Found</h1></body></html>')
 
         result = ErrorDisclosureScanner().scan('https://example.com')
 
@@ -5625,3 +5636,229 @@ class CmsBaselineTest(_BaselineScannerTestBase):
         result = CmsScanner().scan(_SITE + '/')
         admin = [f.affected_url for f in result.findings if f.title.startswith('Admin paneli bulundu')]
         self.assertEqual(admin, [_SITE + '/wp-admin/'])
+
+
+# ---------------------------------------------------------------------------
+# requests.Response truthiness: 4xx/5xx yanıtları "yanıt yok" sayılmamalı
+# Tüm yanıtlar GERÇEK requests.Response'tur (bool(r) == r.ok); MagicMock kullanılmaz.
+# ---------------------------------------------------------------------------
+
+_HOME_WITH_LOGIN = ('<html><body><form action="/login" method="post">'
+                    '<input type="text" name="username"><input type="password" name="password">'
+                    '</form></body></html>')
+
+
+def _routes(table: dict, default=(404, 'Not Found')):
+    """URL sonekine göre gerçek Response döndüren get/post side_effect'i."""
+    def handler(url, **kwargs):
+        for suffix, (status, text, *rest) in table.items():
+            if url.endswith(suffix):
+                return _http_response(status, text, url=url, headers=(rest[0] if rest else None))
+        if callable(default):
+            return default(url, **kwargs)
+        return _http_response(default[0], default[1], url=url)
+    return handler
+
+
+class ResponseTruthinessPremiseTest(TestCase):
+
+    def test_real_response_truthiness_follows_http_status(self):
+        """Hatanın kaynağı: 'if not res' bir 401/403/404/429/500 yanıtını 'yanıt yok' sanır."""
+        self.assertTrue(bool(_http_response(200)))
+        for status in (401, 403, 404, 429, 500, 503):
+            with self.subTest(status=status):
+                self.assertFalse(bool(_http_response(status)))
+
+
+class ErrorDisclosureResponseTruthinessTest(TestCase):
+
+    def _scan(self, MockSession, handler):
+        MockSession.return_value.get.side_effect = handler
+        return ErrorDisclosureScanner().scan('https://example.com')
+
+    def _endpoint(self, result, path):
+        return [f for f in result.findings if f.affected_url == f'https://example.com{path}']
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_401_reaches_auth_required_branch(self, MockSession):
+        result = self._scan(MockSession, _routes({'/actuator': (401, '{"error":"Unauthorized"}')}))
+        finding = self._endpoint(result, '/actuator')
+        self.assertEqual(len(finding), 1)
+        self.assertEqual((finding[0].severity, finding[0].status), (Severity.INFO, FindingStatus.INFORMATIONAL))
+        self.assertIn('HTTP 401 (auth gerekiyor)', finding[0].evidence)
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_403_reaches_forbidden_branch(self, MockSession):
+        result = self._scan(MockSession, _routes({'/phpmyadmin': (403, '<html>Forbidden</html>')}))
+        finding = self._endpoint(result, '/phpmyadmin')
+        self.assertEqual(len(finding), 1)
+        self.assertEqual(finding[0].status, FindingStatus.INFORMATIONAL)
+        self.assertIn('HTTP 403 (yasaklı)', finding[0].evidence)
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_p0_3_catch_all_403_still_suppressed(self, MockSession):
+        """Artık 403 yanıtları değerlendirildiği için soft-404 bastırması gerçekten çalışmalı."""
+        result = self._scan(MockSession, _routes({}, default=(403, '<html>Forbidden</html>')))
+        monitoring = [f for f in result.findings if f.title.startswith("İzleme endpoint'i bulundu")]
+        self.assertEqual(monitoring, [])
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_404_error_page_with_stack_trace_is_analyzed(self, MockSession):
+        page = 'Fatal error: Uncaught Exception in /var/www/html/index.php on line 7'
+        result = self._scan(MockSession, _routes({}, default=(404, page)))
+        self.assertIn('Application Stack Trace Disclosure', [f.title for f in result.findings])
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_200_behavior_unchanged(self, MockSession):
+        body = '{"activeProfiles":[],"propertySources":[]}'
+        result = self._scan(MockSession, _routes({'/actuator/env': (200, body)}))
+        env = self._endpoint(result, '/actuator/env')
+        self.assertEqual((env[0].severity, env[0].status), (Severity.CRITICAL, FindingStatus.CONFIRMED))
+
+    @patch('Tarama.scanners.error_disclosure.requests.Session')
+    def test_request_failure_is_still_no_response(self, MockSession):
+        MockSession.return_value.get.side_effect = requests.ConnectionError('down')
+        result = ErrorDisclosureScanner().scan('https://example.com')
+        self.assertIsNone(result.error)
+        self.assertEqual([f for f in result.findings if f.status != FindingStatus.INFORMATIONAL
+                          and f.status != FindingStatus.SECURE], [])
+
+
+class CmsResponseTruthinessTest(TestCase):
+
+    def _scan(self, MockSession, handler):
+        MockSession.return_value.get.side_effect = handler
+        return CmsScanner().scan('https://example.com')
+
+    def _admin(self, result):
+        return {f.affected_url.rsplit('example.com', 1)[1]: f for f in result.findings
+                if f.title.startswith('Admin paneli bulundu')}
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_401_and_403_admin_paths_reach_secure_branch(self, MockSession):
+        result = self._scan(MockSession, _routes({
+            'example.com': (200, '<html>home</html>'),
+            '/wp-admin/': (401, '<html>Authorization Required</html>'),
+            '/administrator/': (403, '<html>Forbidden</html>'),
+        }))
+        admin = self._admin(result)
+        self.assertEqual(set(admin), {'/wp-admin/', '/administrator/'})
+        self.assertEqual(admin['/wp-admin/'].status, FindingStatus.SECURE)
+        self.assertIn('HTTP 401', admin['/wp-admin/'].evidence)
+        self.assertEqual(admin['/administrator/'].status, FindingStatus.SECURE)
+        self.assertIn('HTTP 403', admin['/administrator/'].evidence)
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_p0_3_deny_all_403_does_not_create_admin_findings(self, MockSession):
+        result = self._scan(MockSession, _routes({'example.com': (200, '<html>home</html>')},
+                                                 default=(403, '<html>Forbidden</html>')))
+        self.assertEqual(self._admin(result), {})
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_200_admin_unchanged_and_404_admin_not_reported(self, MockSession):
+        result = self._scan(MockSession, _routes({
+            'example.com': (200, '<html>home</html>'),
+            '/admin/': (200, '<html><title>Admin</title>' + 'admin console ' * 30 + '</html>'),
+        }))
+        admin = self._admin(result)
+        self.assertEqual(set(admin), {'/admin/'})
+        self.assertEqual(admin['/admin/'].status, FindingStatus.INFORMATIONAL)
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_4xx_homepage_no_longer_aborts_scan(self, MockSession):
+        result = self._scan(MockSession, _routes({'example.com': (403, '<html>Forbidden</html>')}))
+        self.assertIsNone(result.error)
+        self.assertIn('Bilinen CMS tespit edilmedi', [f.title for f in result.findings])
+
+    @patch('Tarama.scanners.cms.requests.Session')
+    def test_homepage_request_failure_still_reported_as_no_response(self, MockSession):
+        MockSession.return_value.get.side_effect = requests.ConnectionError('down')
+        result = CmsScanner().scan('https://example.com')
+        self.assertEqual(result.error, 'Ana sayfa alınamadı')
+
+
+class IntegrityResponseTruthinessTest(TestCase):
+
+    @patch('Tarama.scanners.integrity.requests.Session')
+    def test_4xx_homepage_no_longer_aborts_scan(self, MockSession):
+        page = '<html><head><script src="https://cdn.thirdparty.example/lib.js"></script></head></html>'
+        MockSession.return_value.get.side_effect = _routes({'example.com': (404, page)})
+        result = IntegrityScanner().scan('https://example.com')
+        self.assertIsNone(result.error)
+        self.assertTrue(any(f.title.startswith('SRI eksik') for f in result.findings))
+
+    @patch('Tarama.scanners.integrity.requests.Session')
+    def test_homepage_request_failure_still_reported_as_no_response(self, MockSession):
+        MockSession.return_value.get.side_effect = requests.ConnectionError('down')
+        self.assertEqual(IntegrityScanner().scan('https://example.com').error, 'Ana sayfa alınamadı')
+
+
+class AccessControlResponseTruthinessTest(TestCase):
+
+    def _session(self, MockSession, get_handler):
+        instance = MockSession.return_value
+        instance.get.side_effect = get_handler
+        instance.options.return_value = _http_response(405)
+        instance.request.return_value = _http_response(405)
+        return instance
+
+    @patch('Tarama.scanners.access_control.requests.Session')
+    def test_401_response_cors_headers_are_analyzed(self, MockSession):
+        self._session(MockSession, _routes({'example.com': (
+            401, '{"error":"auth"}', {'Access-Control-Allow-Origin': '*'})}))
+        result = AccessControlScanner().scan('https://example.com')
+        self.assertIn('CORS: Tüm kaynaklara izin verilmiş (wildcard)', [f.title for f in result.findings])
+
+    @patch('Tarama.scanners.access_control.requests.Session')
+    def test_401_response_origin_reflection_is_analyzed(self, MockSession):
+        def handler(url, headers=None, **kwargs):
+            origin = (headers or {}).get('Origin')
+            cors = {'Access-Control-Allow-Origin': origin, 'Access-Control-Allow-Credentials': 'true'} if origin else {}
+            return _http_response(401, '{"error":"auth"}', url=url, headers=cors)
+        self._session(MockSession, handler)
+        result = AccessControlScanner().scan('https://example.com')
+        reflection = [f for f in result.findings if f.title == 'Potentially Insecure CORS Origin Reflection']
+        self.assertEqual(len(reflection), 1)
+        self.assertEqual((reflection[0].severity, reflection[0].status), (Severity.HIGH, FindingStatus.CONFIRMED))
+
+    @patch('Tarama.scanners.access_control.requests.Session')
+    def test_request_failure_is_still_no_response(self, MockSession):
+        instance = self._session(MockSession, None)
+        instance.get.side_effect = requests.ConnectionError('down')
+        result = AccessControlScanner().scan('https://example.com')
+        self.assertEqual([f for f in result.findings if 'CORS' in f.title], [])
+
+
+class AuthRateLimitResponseTruthinessTest(TestCase):
+
+    def _scan(self, MockSession, post_status, headers=None):
+        instance = MockSession.return_value
+        instance.get.side_effect = _routes({'example.com': (200, _HOME_WITH_LOGIN)})
+        instance.post.side_effect = lambda url, **kw: _http_response(post_status, 'slow down', url=url,
+                                                                    headers=headers)
+        return AuthScanner().scan('https://example.com')
+
+    @patch('Tarama.scanners.auth.requests.Session')
+    def test_429_reaches_rate_limit_status_branch(self, MockSession):
+        result = self._scan(MockSession, 429, headers={'Retry-After': '30'})
+        titles = [f.title for f in result.findings]
+        self.assertIn('Rate-limit koruması aktif (HTTP status)', titles)
+        self.assertNotIn('Potential Lack of Authentication Rate Limiting', titles)
+        secure = next(f for f in result.findings if f.title == 'Rate-limit koruması aktif (HTTP status)')
+        self.assertEqual(secure.status, FindingStatus.SECURE)
+        self.assertIn('HTTP 429', secure.evidence)
+
+    @patch('Tarama.scanners.auth.requests.Session')
+    def test_503_reaches_rate_limit_status_branch(self, MockSession):
+        result = self._scan(MockSession, 503)
+        self.assertIn('Rate-limit koruması aktif (HTTP status)', [f.title for f in result.findings])
+
+    @patch('Tarama.scanners.auth.requests.Session')
+    def test_request_failures_are_not_mistaken_for_rate_limiting(self, MockSession):
+        instance = MockSession.return_value
+        instance.get.side_effect = _routes({'example.com': (200, _HOME_WITH_LOGIN)})
+        instance.post.side_effect = requests.ConnectionError('down')
+        result = AuthScanner().scan('https://example.com')
+        titles = [f.title for f in result.findings]
+        self.assertNotIn('Rate-limit koruması aktif (HTTP status)', titles)
+        self.assertIn('Potential Lack of Authentication Rate Limiting', titles)
