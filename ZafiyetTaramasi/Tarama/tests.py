@@ -5241,3 +5241,387 @@ class ScanIdNavigationTest(TestCase):
         job = ScanJob.objects.create(target='https://example.com', status='DONE')
         html = Client().get(f'/Ana/?scan_id={job.id}').content.decode()
         self.assertRegex(html, rf'var scanId = {job.id};')
+
+
+# ---------------------------------------------------------------------------
+# P0-3: Path-probe baseline / soft-404 yanlış pozitif azaltımı (services/path_baseline.py)
+# Tüm HTTP sahte transport ile (gerçek SafeSession üzerinden), DNS mock'lu; ağ yok.
+# ---------------------------------------------------------------------------
+
+from .services.path_baseline import (
+    BASELINE_SAMPLES, MATCH_THRESHOLD, DIFFER_THRESHOLD, PathBaseline, Relation,
+    random_probe_path, signature,
+)
+
+_SITE = 'https://public.example'
+_PROBE_PREFIX = '/__lilith_probe_'
+
+_SPA_SHELL = ('<!doctype html><html><head><title>Acme Portal</title>'
+              '<link rel="stylesheet" href="/static/index.css"></head><body><div id="root"></div>'
+              '<script src="/static/js/main.4f9a1c2e8b7d6a5f.js"></script></body></html>')
+_DEBUG_PAGE = ('<!doctype html><html><head><title>Django Debug Toolbar</title></head><body>'
+               '<h1>SQL queries</h1><table>'
+               + '<tr><td>SELECT * FROM auth_user WHERE id = 1</td><td>3.2ms</td></tr>' * 15
+               + '</table></body></html>')
+
+
+def _custom_404(path: str, request_id: str) -> str:
+    return (f'<html><head><title>Page not found</title></head><body><h1>Sorry!</h1>'
+            f'<p>The page {path} could not be found.</p><small>Request ID: {request_id}</small></body></html>')
+
+
+class _Site(dict):
+    """Sahte site: tanımlı yollar + tanımsız (var olmayan) yollar için davranış."""
+
+    def __init__(self, routes: dict, default):
+        super().__init__({_SITE + path: response for path, response in routes.items()})
+        self.default = default
+
+    def get(self, url, fallback=None):
+        return super().get(url, self.default)
+
+
+def _resp(text='', status=200, url='https://public.example/x', history=None, ctype='text/html'):
+    r = MagicMock()
+    r.text, r.status_code, r.url = text, status, url
+    r.history = history or []
+    r.headers = {'Content-Type': ctype}
+    return r
+
+
+class PathBaselineUnitTest(TestCase):
+    """Karşılaştırma sinyalleri ve eşikler (mock yanıtlar, ağ yok)."""
+
+    def _baseline(self, *responses):
+        samples = []
+        for response in responses:
+            path = random_probe_path()
+            samples.append(signature(response, _SITE + path, path))
+        return PathBaseline(samples)
+
+    def test_random_probe_paths_are_unique_high_entropy_and_not_common_routes(self):
+        paths = {random_probe_path() for _ in range(50)}
+        self.assertEqual(len(paths), 50)
+        for path in paths:
+            self.assertRegex(path, r'^/__lilith_probe_[0-9a-f]{24}__$')
+            self.assertNotIn(path, ('/404', '/notfound', '/test'))
+
+    def test_a_normal_404_baseline_real_200_endpoint_differs(self):
+        baseline = self._baseline(_resp('Not Found', 404), _resp('Not Found', 404))
+        self.assertTrue(baseline.stable)
+        self.assertEqual(baseline.classify(_resp(_DEBUG_PAGE), _SITE + '/debug', '/debug'),
+                         Relation.DIFFERS_FROM_BASELINE)
+
+    def test_b_spa_returning_200_for_every_path_matches(self):
+        baseline = self._baseline(_resp(_SPA_SHELL), _resp(_SPA_SHELL))
+        self.assertEqual(baseline.classify(_resp(_SPA_SHELL), _SITE + '/debug', '/debug'),
+                         Relation.MATCHES_BASELINE)
+
+    def test_c_custom_200_not_found_page_echoing_path_matches(self):
+        p1, p2 = random_probe_path(), random_probe_path()
+        baseline = PathBaseline([
+            signature(_resp(_custom_404(p1, 'a1b2c3d4-0000-4000-8000-000000000001')), _SITE + p1, p1),
+            signature(_resp(_custom_404(p2, 'a1b2c3d4-0000-4000-8000-000000000002')), _SITE + p2, p2),
+        ])
+        candidate = _resp(_custom_404('/actuator', 'ffffffff-1111-4111-8111-111111111111'))
+        self.assertEqual(baseline.classify(candidate, _SITE + '/actuator', '/actuator'),
+                         Relation.MATCHES_BASELINE)
+
+    def test_d_same_status_clearly_different_body_differs(self):
+        """FN kuralı: aynı durum kodu (200) bulguyu tek başına bastırmaz."""
+        baseline = self._baseline(_resp(_SPA_SHELL), _resp(_SPA_SHELL))
+        self.assertEqual(baseline.classify(_resp(_DEBUG_PAGE), _SITE + '/__debug__/', '/__debug__/'),
+                         Relation.DIFFERS_FROM_BASELINE)
+
+    def test_e_small_dynamic_request_id_and_token_differences_still_match(self):
+        def page(request_id, csrf, ts):
+            return (_SPA_SHELL.replace('</body>', f'<meta name="csrf" content="{csrf}">'
+                                       f'<!-- req {request_id} at {ts} --></body>'))
+        baseline = self._baseline(
+            _resp(page('0f1e2d3c-4b5a-4968-8776-655443322110', 'Q' * 40, '2026-10-31T10:00:00Z')),
+            _resp(page('11111111-2222-4333-8444-555555555555', 'W' * 40, '2026-10-31T10:00:01Z')),
+        )
+        candidate = _resp(page('99999999-8888-4777-8666-555555555555', 'E' * 40, '2026-10-31T10:00:02Z'))
+        self.assertEqual(baseline.classify(candidate, _SITE + '/debug', '/debug'), Relation.MATCHES_BASELINE)
+
+    def test_f_redirect_catch_all_matches_and_distinct_redirect_differs(self):
+        p1, p2 = random_probe_path(), random_probe_path()
+        login = 'https://public.example/login?next='
+        baseline = PathBaseline([
+            signature(_resp('<html>Sign in</html>', url=login + p1, history=[MagicMock()]), _SITE + p1, p1),
+            signature(_resp('<html>Sign in</html>', url=login + p2, history=[MagicMock()]), _SITE + p2, p2),
+        ])
+        same = _resp('<html>Sign in</html>', url=login + '/debug', history=[MagicMock()])
+        self.assertEqual(baseline.classify(same, _SITE + '/debug', '/debug'), Relation.MATCHES_BASELINE)
+        distinct = _resp('<html>Kibana</html>', url='https://public.example/kibana/app/home',
+                         history=[MagicMock()])
+        self.assertEqual(baseline.classify(distinct, _SITE + '/kibana', '/kibana'),
+                         Relation.DIFFERS_FROM_BASELINE)
+
+    def test_content_type_difference_is_a_signal(self):
+        baseline = self._baseline(_resp(_SPA_SHELL), _resp(_SPA_SHELL))
+        json_body = _resp('{"activeProfiles": []}', ctype='application/json')
+        self.assertEqual(baseline.classify(json_body, _SITE + '/actuator/env', '/actuator/env'),
+                         Relation.DIFFERS_FROM_BASELINE)
+
+    def test_unstable_baseline_makes_body_only_difference_ambiguous(self):
+        baseline = self._baseline(_resp(_SPA_SHELL), _resp('<html><title>X</title>' + 'random ' * 200 + '</html>'))
+        self.assertFalse(baseline.stable)
+        self.assertEqual(baseline.classify(_resp(_DEBUG_PAGE), _SITE + '/debug', '/debug'), Relation.AMBIGUOUS)
+
+    def test_n_unavailable_baseline_is_never_treated_as_difference(self):
+        baseline = PathBaseline([])
+        self.assertFalse(baseline.available)
+        self.assertEqual(baseline.classify(_resp(_DEBUG_PAGE), _SITE + '/debug', '/debug'),
+                         Relation.BASELINE_UNAVAILABLE)
+
+    def test_n_build_tolerates_request_failures_and_is_bounded(self):
+        session = MagicMock()
+        session.get.side_effect = requests.ConnectionError('down')
+        baseline = PathBaseline.build(session, _SITE, timeout=3)
+        self.assertFalse(baseline.available)
+        self.assertEqual(session.get.call_count, BASELINE_SAMPLES)
+        for call in session.get.call_args_list:
+            self.assertTrue(call.args[0].startswith(_SITE + _PROBE_PREFIX))
+
+    def test_thresholds_are_explicit_and_ordered(self):
+        self.assertGreater(MATCH_THRESHOLD, DIFFER_THRESHOLD)
+        self.assertEqual(BASELINE_SAMPLES, 2)
+
+
+class _BaselineScannerTestBase(_SafeHttpTestBase):
+    """Gerçek SafeSession + sahte transport; her istek P0-1 katmanından geçer."""
+
+    _HOME = (200, {'Content-Type': 'text/html'}, '<html><head><title>Home</title></head><body>home</body></html>')
+
+    def _serve(self, routes: dict, default):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        # cms/integrity önce ana sayfayı alır; tanımsızsa normal bir ana sayfa döner
+        routes = {'/': self._HOME, **routes} if not callable(default) and default[0] != 200 else routes
+        return self._transport(_Site(routes, default))
+
+    def _baseline_requests(self, transport):
+        return [url for _m, url in transport.requested if _PROBE_PREFIX in url]
+
+    def _vulnerabilities(self, result):
+        return [f for f in result.findings
+                if f.status in (FindingStatus.CONFIRMED, FindingStatus.POTENTIAL, FindingStatus.MANUAL_REVIEW)]
+
+
+class ErrorDisclosureBaselineTest(_BaselineScannerTestBase):
+
+    def _monitoring(self, result):
+        return [f for f in result.findings
+                if f.title.startswith("İzleme endpoint'i bulundu") or 'API Documentation' in f.title]
+
+    def test_a_g_normal_404_real_debug_endpoint_confirmed(self):
+        transport = self._serve({'/__debug__/': (200, {'Content-Type': 'text/html'}, _DEBUG_PAGE)},
+                                default=(404, {}, 'Not Found'))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        debug = next(f for f in result.findings if f.affected_url == _SITE + '/__debug__/')
+        self.assertEqual(debug.status, FindingStatus.CONFIRMED)
+        self.assertEqual(debug.severity, Severity.HIGH)
+        self.assertIn("baseline'ından farklı", debug.evidence)
+        self.assertEqual(len(self._baseline_requests(transport)), BASELINE_SAMPLES)   # O, bounded
+
+    def test_b_spa_returning_200_everywhere_produces_no_monitoring_findings(self):
+        """Önceden: /debug, /kibana, /pma, /redis-commander, /_cat/indices ('index') … HIGH/CRITICAL CONFIRMED."""
+        self._serve({}, default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        self.assertEqual(self._monitoring(result), [])
+        self.assertIn("İzleme endpoint'leri bulunamadı", [f.title for f in result.findings])
+
+    def test_c_custom_200_not_found_page_produces_no_monitoring_findings(self):
+        counter = iter(range(10_000))
+
+        def not_found(request):
+            path = request.url[len(_SITE):]
+            return (200, {'Content-Type': 'text/html'},
+                    _custom_404(path, f'{next(counter):08x}-0000-4000-8000-000000000000'))
+        self._serve({}, default=not_found)
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        self.assertEqual(self._monitoring(result), [])
+
+    def test_d_real_debug_endpoint_behind_spa_catch_all_still_confirmed(self):
+        self._serve({'/__debug__/': (200, {'Content-Type': 'text/html'}, _DEBUG_PAGE)},
+                    default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        reported = {f.affected_url: f for f in self._monitoring(result)}
+        self.assertEqual(list(reported), [_SITE + '/__debug__/'])
+        self.assertEqual(reported[_SITE + '/__debug__/'].status, FindingStatus.CONFIRMED)
+
+    def test_h_real_actuator_endpoint_behind_spa_still_confirmed(self):
+        body = '{"activeProfiles":[],"propertySources":[{"name":"systemEnvironment"}]}'
+        self._serve({'/actuator/env': (200, {'Content-Type': 'application/json'}, body)},
+                    default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        env = next(f for f in result.findings if f.affected_url == _SITE + '/actuator/env')
+        self.assertEqual((env.severity, env.status), (Severity.CRITICAL, FindingStatus.CONFIRMED))
+
+    def test_e_f_redirect_catch_all_produces_no_monitoring_findings(self):
+        self._serve({'/': (200, {'Content-Type': 'text/html'}, _SPA_SHELL)},
+                    default=(302, {'Location': '/'}, ''))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        self.assertEqual(self._monitoring(result), [])
+
+    def test_f_redirect_to_distinct_real_page_is_classified_by_evidence(self):
+        kibana = '<html><head><title>Kibana</title></head><body>' + 'kibana dashboard ' * 40 + '</body></html>'
+        self._serve({'/': (200, {'Content-Type': 'text/html'}, _SPA_SHELL),
+                     '/kibana': (302, {'Location': '/kibana/app/home'}, ''),
+                     '/kibana/app/home': (200, {'Content-Type': 'text/html'}, kibana)},
+                    default=(302, {'Location': '/'}, ''))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        reported = {f.affected_url: f for f in self._monitoring(result)}
+        self.assertEqual(list(reported), [_SITE + '/kibana'])
+        self.assertEqual(reported[_SITE + '/kibana'].status, FindingStatus.CONFIRMED)
+
+    def test_catch_all_403_produces_no_endpoint_existence_findings(self):
+        self._serve({}, default=(403, {'Content-Type': 'text/html'}, '<html>Forbidden</html>'))
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        self.assertEqual(self._monitoring(result), [])
+
+    def test_unstable_baseline_keywordless_endpoint_is_potential_not_confirmed(self):
+        counter = iter(range(10_000))
+
+        def random_page(request):
+            n = next(counter)
+            return (200, {'Content-Type': 'text/html'},
+                    f'<html><title>T{n}</title><body>' + f'item{n} unique{n} ' * (20 + n * 7) + '</body></html>')
+        self._serve({'/debug': (200, {'Content-Type': 'text/html'}, _DEBUG_PAGE)}, default=random_page)
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        debug = next(f for f in result.findings if f.affected_url == _SITE + '/debug')
+        self.assertEqual(debug.status, FindingStatus.POTENTIAL)
+        self.assertEqual(debug.confidence, Confidence.LOW)
+        self.assertEqual(debug.severity, Severity.HIGH)   # severity değişmez/artmaz
+
+    def test_n_baseline_failure_never_confirms_or_creates_vulnerability(self):
+        def handler(request):
+            if _PROBE_PREFIX in request.url:
+                raise requests.ConnectionError('baseline probe failed')
+            if request.url == _SITE + '/debug':
+                return (200, {'Content-Type': 'text/html'}, _DEBUG_PAGE)
+            return (404, {}, '')
+        self._serve({}, default=handler)
+        result = ErrorDisclosureScanner().scan(_SITE + '/')
+        self.assertIsNone(result.error)
+        debug = next(f for f in result.findings if f.affected_url == _SITE + '/debug')
+        self.assertEqual(debug.status, FindingStatus.POTENTIAL)
+        self.assertIn("baseline'ı alınamadı", debug.evidence)
+        confirmed = [f for f in result.findings if f.status == FindingStatus.CONFIRMED]
+        self.assertEqual(confirmed, [])
+
+
+class IntegrityBaselineTest(_BaselineScannerTestBase):
+
+    def _file_findings(self, result):
+        return [f for f in result.findings
+                if f.title.startswith(('Dependency Metadata Exposed', 'Hata log dosyası', 'Yol erişilebilir'))]
+
+    def test_k_spa_returning_homepage_for_all_files_produces_no_findings(self):
+        """Önceden: 13 manifest + debug.log için 14 CONFIRMED bulgu."""
+        transport = self._serve({}, default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = IntegrityScanner().scan(_SITE + '/')
+        self.assertEqual(self._file_findings(result), [])
+        self.assertEqual(len(self._baseline_requests(transport)), BASELINE_SAMPLES)
+
+    def test_l_p_real_debug_log_confirmed_and_redacted(self):
+        log = ('[31-Oct-2026 10:00:00 UTC] PHP Warning: mysqli_connect(): password=FakeBaselineLogPw '
+               'in /var/www/html/wp-includes/db.php on line 12\n')
+        self._serve({'/wp-content/debug.log': (200, {'Content-Type': 'text/plain'}, log)},
+                    default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = IntegrityScanner().scan(_SITE + '/')
+        found = self._file_findings(result)
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0].severity, found[0].status), (Severity.MEDIUM, FindingStatus.CONFIRMED))
+        self.assertNotIn('FakeBaselineLogPw', found[0].evidence)
+        self.assertIn('PHP Warning', found[0].evidence)
+
+    def test_real_package_json_behind_spa_confirmed(self):
+        manifest = '{"name": "acme", "dependencies": {"express": "^4.19.2"}}'
+        self._serve({'/package.json': (200, {'Content-Type': 'application/json'}, manifest)},
+                    default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = IntegrityScanner().scan(_SITE + '/')
+        found = self._file_findings(result)
+        self.assertEqual([f.title for f in found], ['Dependency Metadata Exposed: /package.json'])
+        self.assertEqual(found[0].status, FindingStatus.CONFIRMED)
+
+    def test_distinct_html_page_at_manifest_path_is_not_the_file(self):
+        self._serve({'/composer.json': (200, {'Content-Type': 'text/html'}, _DEBUG_PAGE)},
+                    default=(404, {}, 'Not Found'))
+        result = IntegrityScanner().scan(_SITE + '/')
+        self.assertEqual(self._file_findings(result), [])
+
+    def test_unrecognized_non_html_content_is_manual_review_not_confirmed(self):
+        self._serve({'/go.mod': (200, {'Content-Type': 'text/plain'}, 'maintenance mode, try again later')},
+                    default=(404, {}, 'Not Found'))
+        result = IntegrityScanner().scan(_SITE + '/')
+        found = self._file_findings(result)
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0].status, found[0].confidence, found[0].severity),
+                         (FindingStatus.MANUAL_REVIEW, Confidence.LOW, Severity.LOW))
+
+    def test_n_baseline_failure_keeps_content_validated_file_only(self):
+        manifest = 'module example.com/acme\n\ngo 1.22\n'
+
+        def handler(request):
+            if _PROBE_PREFIX in request.url:
+                raise requests.Timeout('baseline timeout')
+            if request.url == _SITE + '/go.mod':
+                return (200, {'Content-Type': 'text/plain'}, manifest)
+            return (200, {'Content-Type': 'text/html'}, _SPA_SHELL)
+        self._serve({}, default=handler)
+        result = IntegrityScanner().scan(_SITE + '/')
+        self.assertEqual([f.title for f in self._file_findings(result)], ['Dependency Metadata Exposed: /go.mod'])
+
+
+class CmsBaselineTest(_BaselineScannerTestBase):
+
+    def _path_findings(self, result):
+        return [f for f in result.findings
+                if f.title.startswith(('Hassas dosya', 'Yol erişilebilir', 'Admin paneli', 'Sürüm bilgisi'))]
+
+    def test_i_fake_env_returning_homepage_is_not_reported(self):
+        self._serve({}, default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = CmsScanner().scan(_SITE + '/')
+        self.assertEqual(self._path_findings(result), [])   # admin/sürüm gürültüsü dahil
+
+    def test_plain_text_catch_all_no_longer_creates_manual_review_noise(self):
+        """Önceden: 200 'Not found' düz metin catch-all → 10 sensitive path MANUAL_REVIEW."""
+        self._serve({}, default=(200, {'Content-Type': 'text/plain'}, 'Not found - nothing to see here.'))
+        result = CmsScanner().scan(_SITE + '/')
+        self.assertEqual(self._path_findings(result), [])
+
+    def test_catch_all_containing_weak_sql_marker_is_not_critical_dump(self):
+        """Önceden: catch-all sayfası 'insert into' içeriyorsa /backup.sql + /db.sql CRITICAL CONFIRMED."""
+        page = ('Documentation: use INSERT INTO statements and CREATE TABLE carefully. '
+                'This text is served for every unknown path.')
+        self._serve({}, default=(200, {'Content-Type': 'text/plain'}, page))
+        result = CmsScanner().scan(_SITE + '/')
+        self.assertEqual([f for f in result.findings if f.severity == Severity.CRITICAL], [])
+
+    def test_j_p_real_env_content_still_detected_and_redacted(self):
+        env = 'APP_ENV=production\nDB_HOST=db.internal\nDB_PASSWORD=FakeBaselineEnvPw\n'
+        self._serve({'/.env': (200, {'Content-Type': 'text/plain'}, env)},
+                    default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = CmsScanner().scan(_SITE + '/')
+        env_finding = next(f for f in result.findings if f.title == 'Hassas dosya erişilebilir: /.env')
+        self.assertEqual((env_finding.severity, env_finding.status), (Severity.CRITICAL, FindingStatus.CONFIRMED))
+        self.assertNotIn('FakeBaselineEnvPw', env_finding.evidence)
+        self.assertIn('DB_PASSWORD=[REDACTED]', env_finding.evidence)
+
+    def test_m_real_git_config_still_detected(self):
+        git = '[core]\n\trepositoryformatversion = 0\n[remote "origin"]\n\turl = https://git.example.com/a/b.git\n'
+        self._serve({'/.git/config': (200, {'Content-Type': 'text/plain'}, git)},
+                    default=(404, {}, 'Not Found'))
+        result = CmsScanner().scan(_SITE + '/')
+        git_finding = next(f for f in result.findings if f.title == 'Hassas dosya erişilebilir: /.git/config')
+        self.assertEqual(git_finding.status, FindingStatus.CONFIRMED)
+
+    def test_real_admin_page_behind_spa_still_reported_spa_paths_not(self):
+        admin_html = ('<html><head><title>WordPress Login</title></head><body>'
+                      + '<form id="loginform">wp-submit user_login user_pass</form>' * 5 + '</body></html>')
+        self._serve({'/wp-admin/': (200, {'Content-Type': 'text/html'}, admin_html)},
+                    default=(200, {'Content-Type': 'text/html'}, _SPA_SHELL))
+        result = CmsScanner().scan(_SITE + '/')
+        admin = [f.affected_url for f in result.findings if f.title.startswith('Admin paneli bulundu')]
+        self.assertEqual(admin, [_SITE + '/wp-admin/'])

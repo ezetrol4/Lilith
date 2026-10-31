@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
 from ..services.evidence_redaction import redact_then_truncate
+from ..services.path_baseline import PathBaseline, Relation
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -142,9 +143,12 @@ class CmsScanner(Scanner):
 
         self._detect_cms(html, target, result)
         self._check_generator_tag(soup, target, result)
-        self._check_version_paths(session, base, target, result)
-        self._check_sensitive_paths(session, base, target, result)
-        self._check_admin_paths(session, base, target, result)
+        # HTTP 200 yolun var olduğunu kanıtlamaz (SPA / catch-all / özel 404): hedefin
+        # var olmayan yol davranışı tarama başına bir kez ölçülür ve tüm yol yoklamalarında kullanılır.
+        baseline = PathBaseline.build(session, base, self.timeout)
+        self._check_version_paths(session, base, target, result, baseline)
+        self._check_sensitive_paths(session, base, target, result, baseline)
+        self._check_admin_paths(session, base, target, result, baseline)
         self._check_robots(session, base, target, result)
 
         return result
@@ -210,9 +214,12 @@ class CmsScanner(Scanner):
     # --- Versiyon sızdıran yollar ---
 
     def _check_version_paths(self, session: requests.Session,
-                              base: str, target: str, result: ScanResult) -> None:
+                              base: str, target: str, result: ScanResult,
+                             baseline: PathBaseline) -> None:
         for path, description in _VERSION_PATHS:
             r = self._get(session, base + path)
+            if r and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
+                continue  # var olmayan yol yanıtından ayırt edilemiyor (soft-404 / catch-all)
             if not r or r.status_code != 200 or len(r.content) < 100:
                 continue
             version = self._extract_version(r.text)
@@ -238,9 +245,12 @@ class CmsScanner(Scanner):
     # --- Hassas dosyalar ---
 
     def _check_sensitive_paths(self, session: requests.Session,
-                                base: str, target: str, result: ScanResult) -> None:
+                                base: str, target: str, result: ScanResult,
+                               baseline: PathBaseline) -> None:
         for path, severity, description in _SENSITIVE_PATHS:
             r = self._get(session, base + path)
+            if r and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
+                continue  # var olmayan yol yanıtından ayırt edilemiyor (soft-404 / catch-all)
             if not r or r.status_code != 200 or len(r.content) < 10:
                 continue
 
@@ -281,9 +291,12 @@ class CmsScanner(Scanner):
     # --- Admin panel erişimi ---
 
     def _check_admin_paths(self, session: requests.Session,
-                            base: str, target: str, result: ScanResult) -> None:
+                            base: str, target: str, result: ScanResult,
+                           baseline: PathBaseline) -> None:
         for path, label in _ADMIN_PATHS:
             r = self._get(session, base + path)
+            if r and baseline.classify(r, base + path, path) == Relation.MATCHES_BASELINE:
+                continue  # var olmayan yol yanıtından ayırt edilemiyor (soft-404 / catch-all)
             if not r or r.status_code not in (200, 401, 403):
                 continue
             title_tag = _page_title(r.text)
