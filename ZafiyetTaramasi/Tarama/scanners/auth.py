@@ -21,6 +21,7 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.auth_safety import (
     ActiveAuthAssessment, ActiveAuthAuthorization, ActiveAuthTest, AuthOutcome,
     OriginBoundaryViolation, outcome_evidence, outcome_for_stop,
@@ -37,8 +38,14 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-_OWASP_AUTH = "A07:2021 - Identification and Authentication Failures"
+_OWASP_AUTH = owasp_2025.A07_AUTHENTICATION_FAILURES
+# Kimlik bilgisinin şifresiz taşınması: CWE-319 → A04 ("doesn't use or enforce TLS")
+_OWASP_TRANSPORT = owasp_2025.A04_CRYPTOGRAPHIC_FAILURES
 _CWE_CLEARTEXT = "CWE-319"  # Cleartext Transmission of Sensitive Information
+# Parola alanlı formun HTTP hedefine gönderimi gözlendi → kimlik bilgisinin korumasız taşınması
+_CWE_CREDENTIAL_TRANSPORT = "CWE-523"  # Unprotected Transport of Credentials (A04:2025 listesi)
+_CWE_EXCESSIVE_AUTH_ATTEMPTS = "CWE-307"  # Improper Restriction of Excessive Authentication Attempts
+_CWE_DEFAULT_CREDENTIALS = "CWE-1392"     # Use of Default Credentials
 
 _LOGIN_PATHS = [
     "/login", "/login/", "/signin", "/signin/",
@@ -284,7 +291,7 @@ class AuthScanner(Scanner):
                             "form) could be tampered with in transit even if the form later posts to HTTPS. "
                             "See the separate finding for the actual credential-submission transport.",
                 affected_url=login_url,
-                owasp=_OWASP_AUTH,
+                owasp=_OWASP_TRANSPORT,
                 cwe=_CWE_CLEARTEXT,
                 recommendation="Serve the login page itself over HTTPS.",
             ))
@@ -310,8 +317,8 @@ class AuthScanner(Scanner):
                 description="The login form's action target uses plain HTTP, so submitted credentials would "
                             "travel unencrypted over the network.",
                 affected_url=action_url,
-                owasp=_OWASP_AUTH,
-                cwe=_CWE_CLEARTEXT,
+                owasp=_OWASP_TRANSPORT,
+                cwe=_CWE_CREDENTIAL_TRANSPORT,
                 recommendation="Require HTTPS and redirect all authentication traffic to TLS-protected endpoints.",
             ))
 
@@ -488,6 +495,7 @@ class AuthScanner(Scanner):
             description=description,
             affected_url=url,
             owasp=_OWASP_AUTH,
+            cwe=_CWE_EXCESSIVE_AUTH_ATTEMPTS,
             recommendation="Manually verify rate limiting / account lockout behavior with a broader, "
                            "controlled test, and implement one if genuinely absent.",
         ))
@@ -670,6 +678,7 @@ class AuthScanner(Scanner):
         result.findings.append(Finding(
             severity=severity, title=title, evidence=text, confidence=confidence, status=status,
             description=description, affected_url=action_url, parameter=user_field, owasp=_OWASP_AUTH,
+            cwe=_CWE_DEFAULT_CREDENTIALS,
             recommendation="Change or disable default credentials immediately and enforce a strong "
                            "password policy on account creation.",
         ))

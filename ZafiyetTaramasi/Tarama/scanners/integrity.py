@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.evidence_redaction import redact_then_truncate
 from ..services.path_baseline import PathBaseline, Relation
 from ..services.safe_http import SafeSession, safe_session
@@ -24,7 +25,13 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-_OWASP_INTEGRITY = "A08:2021 - Software and Data Integrity Failures"
+# SRI / üçüncü taraf script: A08 ("... from untrusted sources, repositories, and CDNs").
+# CSP'siz inline script: güvenlik direktifi eksikliği → A02. Açık log / manifest dosyası:
+# web kökünde hassas dosya → CWE-538 → A01.
+_OWASP_INTEGRITY = owasp_2025.A08_SOFTWARE_OR_DATA_INTEGRITY_FAILURES
+_OWASP_MISCONFIG = owasp_2025.A02_SECURITY_MISCONFIGURATION
+_OWASP_FILE_EXPOSURE = owasp_2025.A01_BROKEN_ACCESS_CONTROL
+_CWE_SENSITIVE_FILE = "CWE-538"  # Insertion of Sensitive Information into Externally-Accessible File or Directory
 _CWE_UNTRUSTED_INCLUSION = "CWE-829"  # Inclusion of Functionality from Untrusted Control Sphere
 
 # Güvenilir, yaygın CDN domainleri
@@ -332,7 +339,7 @@ class IntegrityScanner(Scanner):
                             "they execute unrestricted. If an XSS is ever achieved, an attacker's injected "
                             "script would also run without restriction.",
                 affected_url=target,
-                owasp=_OWASP_INTEGRITY,
+                owasp=_OWASP_MISCONFIG,
                 recommendation="Adopt a Content-Security-Policy using nonces or hashes for inline scripts, "
                                "or move script logic to external files.",
             ))
@@ -396,7 +403,8 @@ class IntegrityScanner(Scanner):
                                 "manifest, log content is unpredictable and may contain paths, queries, or "
                                 "other runtime details.",
                     affected_url=base + path,
-                    owasp=_OWASP_INTEGRITY,
+                    owasp=_OWASP_FILE_EXPOSURE,
+                    cwe=_CWE_SENSITIVE_FILE,
                     recommendation=f"Remove or restrict public access to {path}.",
                 ))
             else:
@@ -410,6 +418,7 @@ class IntegrityScanner(Scanner):
                                 "versions used by the application. This is metadata exposure, not a confirmed "
                                 "vulnerable component — no CVE/version match was performed.",
                     affected_url=base + path,
-                    owasp=_OWASP_INTEGRITY,
+                    owasp=_OWASP_FILE_EXPOSURE,
+                    cwe=_CWE_SENSITIVE_FILE,
                     recommendation=f"Restrict public access to {path} if it is not intentionally published.",
                 ))

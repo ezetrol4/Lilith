@@ -4,12 +4,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.safe_http import OUTBOUND_BLOCKED_MESSAGE
 from ..services.safe_socket import OutboundConnectionBlocked, connect_validated
 
 
-_OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
-_OWASP_CRYPTO = "A02:2021 - Cryptographic Failures"
+# Kimlik doğrulamasız servis: CWE-306 → A07; şifresiz protokol: A04 ("Do not use unencrypted
+# protocols such as FTP"). Yalnızca açık port (erişilebilirlik) zafiyet değildir → kategori yok.
+_OWASP_MISSING_AUTH = owasp_2025.A07_AUTHENTICATION_FAILURES
+_OWASP_CRYPTO = owasp_2025.A04_CRYPTOGRAPHIC_FAILURES
 _CWE_CLEARTEXT = "CWE-319"                # Cleartext Transmission of Sensitive Information
 _CWE_MISSING_AUTH = "CWE-306"             # Missing Authentication for Critical Function
 
@@ -193,7 +196,7 @@ class PortScanner(Scanner):
                 description="Redis responded to an unauthenticated PING with +PONG, confirming that no "
                             "authentication is required to interact with this instance.",
                 affected_url=target,
-                owasp=_OWASP_MISCONFIG,
+                owasp=_OWASP_MISSING_AUTH,
                 cwe=_CWE_MISSING_AUTH,
                 recommendation="Require authentication (requirepass/ACL) and bind Redis to trusted "
                                "networks only — do not expose it directly to the internet.",
@@ -226,7 +229,6 @@ class PortScanner(Scanner):
                             "confirm a vulnerability — actual risk depends on authentication, patch "
                             "level, and access-control configuration that this scan did not verify.",
                 affected_url=target,
-                owasp=_OWASP_MISCONFIG,
                 recommendation=f"Restrict {service} to trusted networks/VPN, verify authentication is "
                                "enforced, and confirm the service is patched, unless public exposure is "
                                "an intentional requirement.",

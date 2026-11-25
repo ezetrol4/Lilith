@@ -12,6 +12,7 @@ import requests
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.safe_http import SafeSession, safe_session
 
 
@@ -20,8 +21,14 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-_OWASP_ACCESS_CONTROL = "A01:2021 - Broken Access Control"
-_OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
+# CORS: A01 açıklaması ("CORS misconfiguration allows API access from unauthorized or untrusted
+# origins"); CWE-942 eklendi (resmi listede A02'de — açık kategori metni önceliklidir).
+# Dizin listeleme: CWE-548 → A01. HttpOnly/Secure: CWE-1004/614 → A02. SameSite: CWE-1275 → A01.
+# TRACE / riskli metotlar: "Unnecessary features are enabled" → A02.
+_OWASP_ACCESS_CONTROL = owasp_2025.A01_BROKEN_ACCESS_CONTROL
+_OWASP_MISCONFIG = owasp_2025.A02_SECURITY_MISCONFIGURATION
+_CWE_PERMISSIVE_CORS = "CWE-942"  # Permissive Cross-domain Policy with Untrusted Domains
+_CWE_SAMESITE = "CWE-1275"        # Sensitive Cookie with Improper SameSite Attribute
 _CWE_DIR_LISTING = "CWE-548"      # Exposure of Information Through Directory Listing
 _CWE_HTTPONLY = "CWE-1004"        # Sensitive Cookie Without 'HttpOnly' Flag
 _CWE_SECURE_FLAG = "CWE-614"      # Sensitive Cookie in HTTPS Session Without 'Secure' Attribute
@@ -121,6 +128,7 @@ class AccessControlScanner(Scanner):
                             "enforce CORS.",
                 affected_url=target,
                 owasp=_OWASP_ACCESS_CONTROL,
+                cwe=_CWE_PERMISSIVE_CORS,
                 recommendation="Do not combine a wildcard origin with Access-Control-Allow-Credentials: true; "
                                "use an explicit allowlist of trusted origins instead.",
             ))
@@ -137,6 +145,7 @@ class AccessControlScanner(Scanner):
                             "intended audience.",
                 affected_url=target,
                 owasp=_OWASP_ACCESS_CONTROL,
+                cwe=_CWE_PERMISSIVE_CORS,
                 recommendation="Confirm this endpoint is meant to be publicly readable by any origin; use an "
                                "explicit allowlist otherwise.",
             ))
@@ -175,6 +184,7 @@ class AccessControlScanner(Scanner):
                             "make authenticated cross-origin requests and read the response.",
                 affected_url=target,
                 owasp=_OWASP_ACCESS_CONTROL,
+                cwe=_CWE_PERMISSIVE_CORS,
                 recommendation="Use an explicit allowlist of trusted origins and avoid reflecting arbitrary "
                                "Origin values, especially while Access-Control-Allow-Credentials is enabled.",
             ))
@@ -192,6 +202,7 @@ class AccessControlScanner(Scanner):
                             "unauthenticated data.",
                 affected_url=target,
                 owasp=_OWASP_ACCESS_CONTROL,
+                cwe=_CWE_PERMISSIVE_CORS,
                 recommendation="Use an explicit allowlist of trusted origins instead of reflecting the "
                                "request's Origin header.",
             ))
@@ -290,7 +301,8 @@ class AccessControlScanner(Scanner):
                                 "session/authentication cookies.",
                     affected_url=target,
                     parameter=cookie_name,
-                    owasp=_OWASP_MISCONFIG,
+                    owasp=_OWASP_ACCESS_CONTROL,
+                    cwe=_CWE_SAMESITE,
                     recommendation="Set SameSite=Lax or SameSite=Strict on session/authentication cookies.",
                 ))
 

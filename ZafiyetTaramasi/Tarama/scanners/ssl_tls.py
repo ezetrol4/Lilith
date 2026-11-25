@@ -4,15 +4,20 @@ import time
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.safe_http import OUTBOUND_BLOCKED_MESSAGE
 from ..services.safe_socket import OutboundConnectionBlocked, connect_validated
 
 
-_OWASP_CRYPTO = "A02:2021 - Cryptographic Failures"
+# A04 açıklaması: zayıf protokol/algoritma, TLS zorlanmaması ve "Is the received server
+# certificate and the trust chain properly validated?" (sertifika bulguları da A04'tür;
+# CWE-295 resmi listede A07'dedir — açık kategori metni önceliklidir)
+_OWASP_CRYPTO = owasp_2025.A04_CRYPTOGRAPHIC_FAILURES
 _CWE_CLEARTEXT = "CWE-319"                  # Cleartext Transmission of Sensitive Information
 _CWE_WEAK_CRYPTO_ALGO = "CWE-327"           # Use of a Broken or Risky Cryptographic Algorithm
 _CWE_INADEQUATE_KEY_STRENGTH = "CWE-326"    # Inadequate Encryption Strength
 _CWE_CERT_VALIDATION = "CWE-295"            # Improper Certificate Validation
+_CWE_KEY_PAST_EXPIRATION = "CWE-324"        # Use of a Key Past its Expiration Date (A04:2025)
 
 # Protokol adi -> zayifligina gore severity. Listede olmayan protokoller (TLS 1.2/1.3) guncel kabul edilir.
 _PROTOCOL_SEVERITY: dict[str, Severity] = {
@@ -50,6 +55,7 @@ class SslScanner(Scanner):
                                 "plain HTTP, so this session was not evaluated over an encrypted channel.",
                     affected_url=target,
                     owasp=_OWASP_CRYPTO,
+                    cwe=_CWE_CLEARTEXT,
                     recommendation="Serve the site over HTTPS by default and redirect HTTP requests to HTTPS.",
                 ))
             except OutboundConnectionBlocked:
@@ -212,6 +218,7 @@ class SslScanner(Scanner):
                                 "reject the connection or display security warnings.",
                     affected_url=target,
                     owasp=_OWASP_CRYPTO,
+                    cwe=_CWE_KEY_PAST_EXPIRATION,
                     recommendation="Renew the certificate immediately.",
                 ))
             elif days_left < _CERT_EXPIRY_WARNING_DAYS:

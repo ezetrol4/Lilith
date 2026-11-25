@@ -12,6 +12,7 @@ import requests
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.evidence_redaction import redact_sensitive_text, redact_then_truncate
 from ..services.path_baseline import PathBaseline, Relation
 from ..services.safe_http import SafeSession, safe_session
@@ -22,7 +23,12 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-_OWASP_MONITORING = "A09:2021 - Security Logging and Monitoring Failures"
+# P0-5: bu scanner günlükleme/alarm TEST ETMEZ (A09 değerlendirilmez). Hata ayıklama modu /
+# yönetim uçları: A02 ("Unnecessary features are enabled", CWE-489). Yığın izi: CWE-209 → A10.
+# Hassas veri içeren API dokümantasyonu: CWE-200 → A01.
+_OWASP_MISCONFIG = owasp_2025.A02_SECURITY_MISCONFIGURATION
+_OWASP_EXCEPTIONAL = owasp_2025.A10_MISHANDLING_OF_EXCEPTIONAL_CONDITIONS
+_OWASP_INFO_EXPOSURE = owasp_2025.A01_BROKEN_ACCESS_CONTROL
 _CWE_ERROR_DISCLOSURE = "CWE-209"  # Generation of Error Message Containing Sensitive Information
 _CWE_ACTIVE_DEBUG_CODE = "CWE-489"  # Active Debug Code
 
@@ -214,7 +220,7 @@ class ErrorDisclosureScanner(Scanner):
                             description="A framework debug page is reliably exposed, revealing source-level "
                                         "internals (settings, installed apps, template context) to visitors.",
                             affected_url=url,
-                            owasp=_OWASP_MONITORING,
+                            owasp=_OWASP_MISCONFIG,
                             cwe=_CWE_ACTIVE_DEBUG_CODE,
                             recommendation="Disable debug mode in the production configuration.",
                         ))
@@ -229,7 +235,7 @@ class ErrorDisclosureScanner(Scanner):
                                         "trace, file path, or database error), which can help an attacker "
                                         "map the application's internals.",
                             affected_url=url,
-                            owasp=_OWASP_MONITORING,
+                            owasp=_OWASP_EXCEPTIONAL,
                             cwe=_CWE_ERROR_DISCLOSURE,
                             recommendation="Return generic error pages to clients and log full details "
                                            "server-side only.",
@@ -323,7 +329,7 @@ class ErrorDisclosureScanner(Scanner):
                                     "field name. Public API docs are not automatically insecure — this is "
                                     "flagged because a credential-like key was observed in the response.",
                         affected_url=base + path,
-                        owasp=_OWASP_MONITORING,
+                        owasp=_OWASP_INFO_EXPOSURE,
                         cwe="CWE-200",
                         recommendation="Review the documentation source for embedded secrets/tokens and "
                                        "remove them; regenerate any credential that was exposed.",
@@ -369,7 +375,7 @@ class ErrorDisclosureScanner(Scanner):
                 status=status,
                 description=description,
                 affected_url=base + path,
-                owasp=None if severity == Severity.INFO else _OWASP_MONITORING,
+                owasp=None if severity == Severity.INFO else _OWASP_MISCONFIG,
                 recommendation=None if severity == Severity.INFO else
                                f"Restrict {path} to internal networks or authenticated operators only.",
             ))
