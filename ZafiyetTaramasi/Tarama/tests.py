@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import socket
@@ -76,6 +77,8 @@ def _http_response(status: int, text: str = '', url: str = 'https://example.com/
                        429: 'Too Many Requests', 500: 'Internal Server Error',
                        503: 'Service Unavailable'}.get(status, '')
     response._content = text.encode()
+    response._content_consumed = True   # gerçek yanıt gibi: SafeSession ara yönlendirmeleri close() eder
+    response.raw = io.BytesIO(b'')
     response.encoding = 'utf-8'
     response.url = url
     response.headers = CaseInsensitiveDict(headers or {})
@@ -5861,4 +5864,407 @@ class AuthRateLimitResponseTruthinessTest(TestCase):
         result = AuthScanner().scan('https://example.com')
         titles = [f.title for f in result.findings]
         self.assertNotIn('Rate-limit koruması aktif (HTTP status)', titles)
-        self.assertIn('Potential Lack of Authentication Rate Limiting', titles)
+        # P0-4: hiç yanıt gözlemlenmediğinde "rate limiting yok" da iddia edilemez — eskiden
+        # 'Potential Lack of Authentication Rate Limiting' (MANUAL_REVIEW) üretiliyordu.
+        self.assertNotIn('Potential Lack of Authentication Rate Limiting', titles)
+        inconclusive = next(f for f in result.findings if f.title == 'Rate-limit testi sonuçsuz')
+        self.assertEqual(inconclusive.status, FindingStatus.INFORMATIONAL)
+
+
+# ---------------------------------------------------------------------------
+# P0-4: Kimlik doğrulama baseline'ı (services/auth_validation.py + scanners/auth.py)
+# Sahte login uygulaması GERÇEK requests.Response döndürür (bool(r) == r.ok);
+# 302 yönlendirmeleri SafeSession tarafından takip edilir. Tüm değerler SAHTEDİR.
+# ---------------------------------------------------------------------------
+
+import itertools
+
+from .services.auth_validation import (
+    AttemptKind, LoginComparison, SIGNAL_DISTINCT_LOCATION, SIGNAL_FORM_DISAPPEARED,
+    SIGNAL_LOGOUT_APPEARED, classify_attempt, compare_login, invalid_credentials,
+)
+from .scanners.auth import _DEFAULT_CREDS
+
+_ORIGIN = 'https://example.com'
+_ACTION = _ORIGIN + '/login'
+_DEFAULT_USERS = {u for u, _p in _DEFAULT_CREDS}
+
+
+def _form(token='static-token'):
+    return ('<form action="/login" method="post">'
+            f'<input type="hidden" name="csrf_token" value="{token}">'
+            '<input type="text" name="username"><input type="password" name="password">'
+            '<button>Sign in</button></form>')
+
+
+def _login_page(token='static-token', banner=''):
+    return (f'<html><head><title>Example Portal</title></head><body>{banner}'
+            f'<h1>Sign in</h1>{_form(token)}</body></html>')
+
+
+def _failed_page(token='static-token', request_id='0f1e2d3c-4b5a-4968-8776-655443322110', banner=''):
+    return (f'<html><head><title>Example Portal</title></head><body>{banner}'
+            f'<p class="error">Invalid username or password.</p>{_form(token)}'
+            f'<!-- request {request_id} --></body></html>')
+
+
+_DASHBOARD = ('<html><head><title>Example Portal — Dashboard</title></head><body>'
+              '<nav><a href="/account">My account</a> <a href="/logout">Log out</a></nav>'
+              '<h1>Dashboard</h1>' + '<div class="widget">Recent activity</div>' * 10 + '</body></html>')
+
+
+class _LoginApp:
+    """GET: login sayfası (veya tanımlı sayfalar). POST /login: on_post(username, password, data)
+    → (status, text, headers) | Exception. Tüm gönderimler kaydedilir."""
+
+    def __init__(self, on_post, pages=None, login_page=None):
+        self.on_post = on_post
+        self.pages = pages or {}
+        self.login_page = login_page or (lambda: _login_page())
+        self.posts: list[tuple[str, str]] = []
+
+    def get(self, url, **kwargs):
+        path = url[len(_ORIGIN):] or '/'
+        for page_path, (status, text) in self.pages.items():
+            if path.split('?')[0] == page_path:
+                return _http_response(status, text, url=url)
+        return _http_response(200, self.login_page(), url=url)
+
+    def post(self, url, data=None, **kwargs):
+        data = data or {}
+        self.posts.append((data.get('username', ''), data.get('password', '')))
+        outcome = self.on_post(data.get('username', ''), data.get('password', ''), data)
+        if isinstance(outcome, Exception):
+            raise outcome
+        status, text, *rest = outcome
+        return _http_response(status, text, url=url, headers=rest[0] if rest else None)
+
+    def default_cred_posts(self):
+        return [(u, p) for u, p in self.posts if u in _DEFAULT_USERS]
+
+
+class _AuthScanTestBase(TestCase):
+
+    def _scan(self, MockSession, app: _LoginApp):
+        instance = MockSession.return_value
+        instance.get.side_effect = app.get
+        instance.post.side_effect = app.post
+        return AuthScanner().scan(_ORIGIN)
+
+    @staticmethod
+    def _default_cred_findings(result):
+        return [f for f in result.findings if f.title.startswith('Varsayılan kimlik bilgi')
+                and f.status in (FindingStatus.CONFIRMED, FindingStatus.POTENTIAL, FindingStatus.MANUAL_REVIEW)]
+
+    @staticmethod
+    def _titles(result):
+        return [f.title for f in result.findings]
+
+
+class AuthValidationUnitTest(TestCase):
+    """Karşılaştırma ve deneme sınıflandırması (gerçek Response nesneleri)."""
+
+    def _cmp(self, baseline, candidate, user='admin'):
+        return compare_login(baseline, candidate, action_url=_ACTION,
+                             baseline_username='__lilith_invalid_abc', candidate_username=user)
+
+    def test_invalid_credentials_are_random_and_not_common_usernames(self):
+        pairs = {invalid_credentials() for _ in range(20)}
+        self.assertEqual(len(pairs), 20)
+        for user, password in pairs:
+            self.assertTrue(user.startswith('__lilith_invalid_'))
+            self.assertNotIn(user, _DEFAULT_USERS)
+            self.assertNotEqual(user, password)
+
+    def test_a_identical_failed_pages_match(self):
+        page = _http_response(200, _failed_page(), url=_ACTION)
+        self.assertEqual(self._cmp(page, _http_response(200, _failed_page(), url=_ACTION)).comparison,
+                         LoginComparison.MATCHES_FAILED_LOGIN)
+
+    def test_e_dynamic_csrf_request_id_and_echoed_username_still_match(self):
+        baseline = _http_response(200, _failed_page('A' * 40, '11111111-2222-4333-8444-555555555555',
+                                                    banner='User __lilith_invalid_abc not found'), url=_ACTION)
+        candidate = _http_response(200, _failed_page('B' * 40, '99999999-8888-4777-8666-555555555555',
+                                                     banner='User admin not found'), url=_ACTION)
+        evidence = self._cmp(baseline, candidate)
+        self.assertEqual(evidence.comparison, LoginComparison.MATCHES_FAILED_LOGIN)
+        self.assertFalse(evidence.confirmed)
+
+    def test_c_authenticated_state_signals_detected(self):
+        evidence = self._cmp(_http_response(200, _failed_page(), url=_ACTION),
+                             _http_response(200, _DASHBOARD, url=_ORIGIN + '/dashboard'))
+        self.assertTrue(evidence.confirmed)
+        self.assertEqual(set(evidence.strong_signals),
+                         {SIGNAL_DISTINCT_LOCATION, SIGNAL_FORM_DISAPPEARED, SIGNAL_LOGOUT_APPEARED})
+
+    def test_keyword_alone_is_not_a_strong_signal(self):
+        evidence = self._cmp(_http_response(200, _failed_page(), url=_ACTION),
+                             _http_response(200, _failed_page(banner='Welcome back! Your dashboard profile'),
+                                            url=_ACTION))
+        self.assertEqual(evidence.strong_signals, [])
+        self.assertFalse(evidence.confirmed)
+        self.assertFalse(evidence.potential)
+
+    def test_redirect_to_lock_or_mfa_or_error_page_is_not_distinct_authenticated_location(self):
+        for path in ('/account/locked', '/mfa/verify', '/login?error=1', '/challenge', '/password/reset'):
+            with self.subTest(path=path):
+                evidence = self._cmp(_http_response(200, _failed_page(), url=_ACTION),
+                                     _http_response(200, '<html>Please continue.</html>', url=_ORIGIN + path))
+                self.assertNotIn(SIGNAL_DISTINCT_LOCATION, evidence.strong_signals)
+                self.assertFalse(evidence.confirmed)
+
+    def test_non_2xx_candidate_never_yields_authenticated_signals(self):
+        for status in (401, 403, 500):
+            with self.subTest(status=status):
+                evidence = self._cmp(_http_response(200, _failed_page(), url=_ACTION),
+                                     _http_response(status, _DASHBOARD, url=_ORIGIN + '/dashboard'))
+                self.assertFalse(evidence.confirmed)
+                self.assertEqual(evidence.strong_signals, [])
+
+    def test_attempt_classification(self):
+        ref = (_login_page(),)
+        cases = [
+            (None, AttemptKind.NETWORK_FAILURE),
+            (_http_response(429, ''), AttemptKind.RATE_LIMITED),
+            (_http_response(503, 'Service Unavailable'), AttemptKind.SERVER_ERROR),
+            (_http_response(503, 'Too many requests, slow down'), AttemptKind.RATE_LIMITED),
+            (_http_response(503, '', headers={'Retry-After': '60'}), AttemptKind.RATE_LIMITED),
+            (_http_response(500, 'boom'), AttemptKind.SERVER_ERROR),
+            (_http_response(403, 'Forbidden'), AttemptKind.BLOCKED),
+            (_http_response(200, 'Attention Required! Verify you are human'), AttemptKind.BLOCKED),
+            (_http_response(200, _failed_page(), headers={'X-RateLimit-Limit': '100',
+                                                          'X-RateLimit-Remaining': '97'}), AttemptKind.NORMAL),
+            (_http_response(200, _failed_page(), headers={'X-RateLimit-Remaining': '0'}), AttemptKind.RATE_LIMITED),
+            (_http_response(200, _failed_page()), AttemptKind.NORMAL),
+            (_http_response(401, '{"error":"invalid credentials"}'), AttemptKind.NORMAL),
+        ]
+        for response, expected in cases:
+            with self.subTest(expected=expected, status=getattr(response, 'status_code', None)):
+                self.assertEqual(classify_attempt(response, ref).kind, expected)
+
+    def test_static_lockout_text_on_login_page_is_not_rate_limiting(self):
+        banner = 'Your account will be temporarily locked after too many attempts.'
+        response = _http_response(200, _failed_page(banner=banner))
+        self.assertEqual(classify_attempt(response, (_login_page(banner=banner),)).kind, AttemptKind.NORMAL)
+
+
+@patch('Tarama.scanners.auth.requests.Session')
+class DefaultCredentialBaselineTest(_AuthScanTestBase):
+
+    def test_a_identical_login_page_for_every_attempt_no_finding(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        result = self._scan(MockSession, app)
+        self.assertEqual(self._default_cred_findings(result), [])
+        self.assertIn('Varsayılan kimlik bilgileri geçersiz', self._titles(result))
+
+    def test_b_welcome_on_failed_page_is_not_a_false_positive(self, MockSession):
+        """Önceden: 'welcome' kelimesi → CRITICAL CONFIRMED 'Varsayılan kimlik bilgileri geçerli'."""
+        banner = '<h2>Welcome to Example Portal</h2>'
+        app = _LoginApp(lambda u, p, d: (200, _failed_page(banner=banner)),
+                        login_page=lambda: _login_page(banner=banner))
+        result = self._scan(MockSession, app)
+        self.assertEqual(self._default_cred_findings(result), [])
+
+    def test_c_d_valid_credential_redirect_to_dashboard_is_confirmed_with_explained_evidence(self, MockSession):
+        def on_post(user, password, data):
+            if (user, password) == ('admin', 'admin'):
+                return 302, '', {'Location': '/dashboard', 'Set-Cookie': 'sessionid=FakeSessionValue; HttpOnly'}
+            return 302, '', {'Location': '/login?error=1'}
+        app = _LoginApp(on_post, pages={'/dashboard': (200, _DASHBOARD)})
+        result = self._scan(MockSession, app)
+
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgileri geçerli')
+        self.assertEqual((finding.severity, finding.status, finding.confidence),
+                         (Severity.CRITICAL, FindingStatus.CONFIRMED, Confidence.HIGH))
+        self.assertIn("Başarısız-giriş baseline'ı: HTTP 200, /login", finding.evidence)
+        self.assertIn('Aday: HTTP 200, /dashboard (yönlendirme), giriş formu yok', finding.evidence)
+        self.assertIn('çıkış (logout/sign out) kontrolü göründü', finding.evidence)
+        # P: parola, cookie/oturum değeri ve baseline kimlik bilgileri kanıtta yok
+        self.assertNotIn('admin', finding.evidence.split('Parola:')[1].split('|')[0])
+        self.assertNotIn('FakeSessionValue', finding.evidence)
+        self.assertNotIn('__lilith_invalid_', finding.evidence)
+
+    def test_e_dynamic_tokens_on_failed_pages_no_false_positive(self, MockSession):
+        counter = itertools.count()
+
+        def on_post(user, password, data):
+            n = next(counter)
+            return 200, _failed_page(token=f'{n:040d}', request_id=f'{n:08d}-1111-4111-8111-111111111111')
+        result = self._scan(MockSession, _LoginApp(on_post))
+        self.assertEqual(self._default_cred_findings(result), [])
+
+    def test_f_generic_200_without_form_is_not_confirmed(self, MockSession):
+        def on_post(user, password, data):
+            return (200, '<html><body>OK</body></html>') if user == 'admin' else (200, _failed_page())
+        result = self._scan(MockSession, _LoginApp(on_post))
+        found = self._default_cred_findings(result)
+        self.assertEqual(len(found), 1)
+        self.assertNotEqual(found[0].status, FindingStatus.CONFIRMED)
+        self.assertEqual(found[0].status, FindingStatus.POTENTIAL)
+        self.assertEqual(found[0].severity, Severity.HIGH)   # CRITICAL'dan yüksek değil
+
+    def test_g_different_response_without_authenticated_state_is_manual_review(self, MockSession):
+        def on_post(user, password, data):
+            if user == 'admin':
+                return 200, _failed_page(banner='<p>Your password has expired. Contact support to reset it '
+                                                'before signing in again. ' + 'Details. ' * 30 + '</p>')
+            return 200, _failed_page()
+        result = self._scan(MockSession, _LoginApp(on_post))
+        found = self._default_cred_findings(result)
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0].status, found[0].confidence), (FindingStatus.MANUAL_REVIEW, Confidence.LOW))
+
+    def test_h_baseline_network_failure_creates_no_default_credential_finding(self, MockSession):
+        app = _LoginApp(lambda u, p, d: requests.ConnectionError('down'))
+        result = self._scan(MockSession, app)
+        self.assertEqual(self._default_cred_findings(result), [])
+        skipped = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi yapılmadı')
+        self.assertEqual(skipped.status, FindingStatus.INFORMATIONAL)
+        self.assertEqual(app.default_cred_posts(), [])   # baseline yoksa aday denenmez
+
+    def test_i_candidate_401_is_explicit_rejection(self, MockSession):
+        def on_post(user, password, data):
+            return (401, '{"error":"invalid credentials"}') if user in _DEFAULT_USERS else (200, _failed_page())
+        result = self._scan(MockSession, _LoginApp(on_post))
+        self.assertEqual(self._default_cred_findings(result), [])
+
+    def test_i_api_style_401_baseline_and_401_candidates(self, MockSession):
+        result = self._scan(MockSession, _LoginApp(lambda u, p, d: (401, '{"error":"invalid credentials"}')))
+        self.assertEqual(self._default_cred_findings(result), [])
+        self.assertIn('Varsayılan kimlik bilgileri geçersiz', self._titles(result))
+
+    def test_i_candidate_403_stops_attempts_and_is_not_success(self, MockSession):
+        def on_post(user, password, data):
+            return (403, '<html>Forbidden</html>') if user == 'admin' else (200, _failed_page())
+        app = _LoginApp(on_post)
+        result = self._scan(MockSession, app)
+        self.assertEqual(self._default_cred_findings(result), [])
+        self.assertIn('Varsayılan kimlik bilgisi testi tamamlanamadı', self._titles(result))
+        self.assertEqual(len(app.default_cred_posts()), 1)   # engelleme sonrası durdu
+
+    def test_j_baseline_rate_limited_skips_default_credentials(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (429, 'Too Many Requests', {'Retry-After': '60'}))
+        result = self._scan(MockSession, app)
+        self.assertIn('Rate-limit koruması aktif (HTTP status)', self._titles(result))
+        self.assertIn('Varsayılan kimlik bilgisi testi yapılmadı', self._titles(result))
+        self.assertEqual(app.default_cred_posts(), [])
+
+    def test_q_r_attempts_bounded_predefined_and_stop_on_rate_limit(self, MockSession):
+        def on_post(user, password, data):
+            return (429, 'slow down') if user == 'admin' and password == 'password' else (200, _failed_page())
+        app = _LoginApp(on_post)
+        self._scan(MockSession, app)
+        attempted = app.default_cred_posts()
+        self.assertEqual(attempted, list(_DEFAULT_CREDS[:2]))   # liste sırası, türetme yok, 429'da dur
+        self.assertLessEqual(len(app.posts), 5 + 1 + len(_DEFAULT_CREDS))
+
+    def test_q_full_run_posts_exactly_predefined_credentials(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        self._scan(MockSession, app)
+        self.assertEqual(app.default_cred_posts(), list(_DEFAULT_CREDS))
+        self.assertEqual(len(app.posts), 5 + 1 + len(_DEFAULT_CREDS))   # rate-limit + baseline + liste
+        invalid = [u for u, _p in app.posts if u.startswith('__lilith_invalid_')]
+        self.assertEqual(len(invalid), 1)
+
+    def test_session_isolation_fresh_session_and_csrf_token_per_attempt(self, MockSession):
+        """Tek kullanımlık CSRF: önceden tüm gönderimler ilk token'ı yeniden kullanıyordu."""
+        issued, valid = itertools.count(), set()
+
+        def login_page():
+            token = f'csrf{next(issued):04d}'
+            valid.add(token)
+            return _login_page(token)
+
+        def on_post(user, password, data):
+            token = data.get('csrf_token')
+            if token not in valid:
+                return 403, '<html>CSRF verification failed</html>'
+            valid.discard(token)
+            if (user, password) == ('admin', 'admin'):
+                return 302, '', {'Location': '/dashboard'}
+            return 200, _failed_page(token=f'csrf-next-{token}')
+        app = _LoginApp(on_post, pages={'/dashboard': (200, _DASHBOARD)}, login_page=login_page)
+        result = self._scan(MockSession, app)
+
+        self.assertIn('Varsayılan kimlik bilgileri geçerli', self._titles(result))
+        # ana oturum + baseline + her aday için ayrı oturum (başarıda durur: admin/admin ilk aday)
+        self.assertEqual(MockSession.call_count, 1 + 1 + 1)
+
+
+@patch('Tarama.scanners.auth.requests.Session')
+class RateLimitClassificationTest(_AuthScanTestBase):
+
+    def test_k_generic_503_alone_is_not_rate_limiting(self, MockSession):
+        result = self._scan(MockSession, _LoginApp(lambda u, p, d: (503, 'Service Unavailable')))
+        titles = self._titles(result)
+        self.assertFalse([t for t in titles if t.startswith(('Rate-limit koruması aktif', 'Hesap kilidi'))])
+        self.assertIn('Rate-limit testi sonuçsuz', titles)
+        self.assertNotIn('Potential Lack of Authentication Rate Limiting', titles)
+
+    def test_l_503_with_retry_after_is_rate_limiting(self, MockSession):
+        result = self._scan(MockSession, _LoginApp(lambda u, p, d: (503, 'Unavailable', {'Retry-After': '120'})))
+        secure = next(f for f in result.findings if f.title == 'Rate-limit koruması aktif (HTTP status)')
+        self.assertEqual(secure.status, FindingStatus.SECURE)
+        self.assertIn('Retry-After: 120', secure.evidence)
+
+    def test_informational_ratelimit_headers_alone_are_not_secure(self, MockSession):
+        headers = {'X-RateLimit-Limit': '100', 'X-RateLimit-Remaining': '99'}
+        result = self._scan(MockSession, _LoginApp(lambda u, p, d: (200, _failed_page(), headers)))
+        self.assertIn('Potential Lack of Authentication Rate Limiting', self._titles(result))
+
+    def test_static_lockout_text_on_login_page_is_not_secure(self, MockSession):
+        banner = 'Accounts are temporarily locked after too many attempts.'
+        app = _LoginApp(lambda u, p, d: (200, _failed_page(banner=banner)),
+                        login_page=lambda: _login_page(banner=banner))
+        result = self._scan(MockSession, app)
+        self.assertIn('Potential Lack of Authentication Rate Limiting', self._titles(result))
+
+    def test_throttle_text_appearing_after_repeated_attempts_is_secure(self, MockSession):
+        counter = itertools.count()
+
+        def on_post(user, password, data):
+            n = next(counter)
+            return 200, _failed_page(banner='Too many login attempts. Try again in 5 minutes.' if n >= 3 else '')
+        result = self._scan(MockSession, _LoginApp(on_post))
+        lock = next(f for f in result.findings if f.title == 'Hesap kilidi / rate-limit koruması aktif')
+        self.assertEqual((lock.status, lock.confidence), (FindingStatus.SECURE, Confidence.MEDIUM))
+        self.assertIn('4. başarısız denemede', lock.evidence)
+
+    def test_waf_challenge_is_not_rate_limiting_nor_lack_of_it(self, MockSession):
+        result = self._scan(MockSession, _LoginApp(lambda u, p, d: (403, '<html>Attention Required</html>')))
+        titles = self._titles(result)
+        self.assertIn('Rate-limit testi sonuçsuz: WAF/challenge yanıtı', titles)
+        self.assertNotIn('Potential Lack of Authentication Rate Limiting', titles)
+        self.assertFalse([t for t in titles if t.startswith('Rate-limit koruması aktif')])
+
+    def test_m_network_failure_is_separate_from_http_error(self, MockSession):
+        result = self._scan(MockSession, _LoginApp(lambda u, p, d: requests.Timeout('slow')))
+        finding = next(f for f in result.findings if f.title == 'Rate-limit testi sonuçsuz')
+        self.assertIn('yanıt yok: 5', finding.evidence)
+        self.assertIn('sunucu hatası: 0', finding.evidence)
+
+
+class AuthSafeSessionEndToEndTest(_SafeHttpTestBase):
+    """N, O: tüm giriş denemeleri gerçek SafeSession (P0-1) üzerinden; DNS mock'lu, ağ yok."""
+
+    def test_default_credential_flow_through_safe_session(self):
+        self._dns({'public.example': [_PUBLIC_IP]})
+        login = ('<html><title>Portal</title><form action="/login" method="post">'
+                 '<input name="username"><input type="password" name="password"></form></html>')
+        failed = login.replace('<form', '<p>Invalid credentials</p><form')
+
+        def do_login(request):
+            body = request.body or ''
+            if 'username=admin&password=admin' in body:
+                return (302, {'Location': '/dashboard'}, '')
+            return (200, {'Content-Type': 'text/html'}, failed)
+        transport = self._transport({
+            'https://public.example/': (200, {'Content-Type': 'text/html'}, login),
+            'https://public.example/login': do_login,
+            'https://public.example/dashboard': (200, {'Content-Type': 'text/html'}, _DASHBOARD),
+        })
+        result = AuthScanner().scan('https://public.example/')
+
+        self.assertIn('Varsayılan kimlik bilgileri geçerli', [f.title for f in result.findings])
+        self.assertEqual(transport.hosts(), {'public.example'})
+        self.assertTrue(any(url.endswith('/dashboard') for _m, url in transport.requested))
