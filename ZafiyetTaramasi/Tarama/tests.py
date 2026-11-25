@@ -696,7 +696,7 @@ class SqlScannerTest(TestCase):
         self.assertIn('user', high[0].evidence)
         self.assertEqual(high[0].confidence, Confidence.HIGH)
         self.assertEqual(high[0].status, FindingStatus.POTENTIAL)
-        self.assertEqual(high[0].owasp, 'A03:2021 - Injection')
+        self.assertEqual(high[0].owasp, 'A05:2025 - Injection')
         self.assertEqual(high[0].cwe, 'CWE-89')
 
     @patch('Tarama.scanners.sql.requests.Session')
@@ -1240,7 +1240,7 @@ class XssScannerTest(TestCase):
         self.assertIn('Potential Reflected XSS', high[0].title)
         self.assertEqual(high[0].confidence, Confidence.HIGH)
         self.assertEqual(high[0].status, FindingStatus.POTENTIAL)
-        self.assertEqual(high[0].owasp, 'A03:2021 - Injection')
+        self.assertEqual(high[0].owasp, 'A05:2025 - Injection')
         self.assertEqual(high[0].cwe, 'CWE-79')
 
     @patch('Tarama.scanners.xss.requests.Session')
@@ -2264,7 +2264,7 @@ class AuthScannerTest(TestCase):
         self.assertTrue(any('Unencrypted Transport' in f.title for f in high))
         transport_finding = next(f for f in high if 'Unencrypted Transport' in f.title)
         self.assertEqual(transport_finding.status, FindingStatus.CONFIRMED)
-        self.assertEqual(transport_finding.cwe, 'CWE-319')
+        self.assertEqual(transport_finding.cwe, 'CWE-523')   # P0-5: parola formunun HTTP gönderimi gözlendi
 
     @patch('Tarama.scanners.auth.requests.Session')
     def test_no_captcha_flagged(self, MockSession):
@@ -2676,7 +2676,7 @@ class CmdInjectionScannerTest(TestCase):
         self.assertIn('host', crit[0].evidence)
         self.assertEqual(crit[0].confidence, Confidence.HIGH)
         self.assertEqual(crit[0].status, FindingStatus.CONFIRMED)
-        self.assertEqual(crit[0].owasp, 'A03:2021 - Injection')
+        self.assertEqual(crit[0].owasp, 'A05:2025 - Injection')
         self.assertEqual(crit[0].cwe, 'CWE-78')
 
     @patch('Tarama.scanners.cmd.requests.Session')
@@ -7086,3 +7086,271 @@ class InjectionCredentialFormGuardTest(_SafeHttpTestBase):
                 result = scanner_cls().scan(_LAB + '/api/users')
                 self.assertIn(('POST', _LAB + '/api/users'), transport.requested)
                 self.assertNotIn(NOT_ASSESSED_ENDPOINT_TITLE, [f.title for f in result.findings])
+
+
+# ---------------------------------------------------------------------------
+# P0-5: OWASP Top 10:2025 eşlemesi (scanners/owasp.py tek kaynak)
+# Yalnızca sınıflandırma: payload, tespit, severity/confidence/status değişmez.
+# ---------------------------------------------------------------------------
+
+import ast
+import functools
+import importlib
+
+from .scanners import owasp as owasp_2025
+
+_SCANNER_DIR = pathlib.Path(__file__).resolve().parent / 'scanners'
+_OFFICIAL_2025 = (
+    'A01:2025 - Broken Access Control',
+    'A02:2025 - Security Misconfiguration',
+    'A03:2025 - Software Supply Chain Failures',
+    'A04:2025 - Cryptographic Failures',
+    'A05:2025 - Injection',
+    'A06:2025 - Insecure Design',
+    'A07:2025 - Authentication Failures',
+    'A08:2025 - Software or Data Integrity Failures',
+    'A09:2025 - Security Logging and Alerting Failures',
+    'A10:2025 - Mishandling of Exceptional Conditions',
+)
+_A01, _A02, _A03, _A04, _A05, _A06, _A07, _A08, _A09, _A10 = _OFFICIAL_2025
+
+
+def _resolve(module, node):
+    """owasp=/cwe= ifadesinin alabileceği tüm değerler (Name → modül sabiti, IfExp → iki dal)."""
+    if node is None:
+        return {None}
+    if isinstance(node, ast.Constant):
+        return {node.value}
+    if isinstance(node, ast.Name):
+        # Yerel değişken (ör. headers tablosundaki cwe) statik çözülemez — işaretlenir; owasp için
+        # bu, "resmi 2025 sabiti veya None" testinde başarısız olur (sabit kullanımı zorunlu)
+        return {getattr(module, node.id)} if hasattr(module, node.id) else {f'<local:{node.id}>'}
+    if isinstance(node, ast.IfExp):
+        return _resolve(module, node.body) | _resolve(module, node.orelse)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == 'get':
+        mapping = getattr(module, node.func.value.id)          # dict.get(key, default)
+        return set(mapping.values()) | _resolve(module, node.args[1])
+    raise AssertionError(f'{module.__name__}: çözülemeyen ifade {ast.dump(node)}')
+
+
+@functools.lru_cache(maxsize=1)
+def _finding_mappings():
+    """Her scanner modülündeki her Finding(...) çağrısı → (modül, başlık kaynağı, owasp değerleri, cwe değerleri)."""
+    rows = []
+    for path in sorted(_SCANNER_DIR.glob('*.py')):
+        module = importlib.import_module(f'Tarama.scanners.{path.stem}')
+        source = path.read_text(encoding='utf-8')
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Call) and getattr(node.func, 'id', None) == 'Finding':
+                kw = {k.arg: k.value for k in node.keywords}
+                title = ast.get_source_segment(source, kw['title']) if 'title' in kw else ''
+                rows.append((path.stem, title, frozenset(_resolve(module, kw.get("owasp"))),
+                             frozenset(_resolve(module, kw.get("cwe")))))
+    return tuple(rows)
+
+
+def _mapping(module_name, title_fragment):
+    matches = [(o, c) for m, t, o, c in _finding_mappings() if m == module_name and title_fragment in t]
+    if not matches:
+        raise AssertionError(f'{module_name}: başlık bulunamadı: {title_fragment}')
+    return matches
+
+
+class OwaspCategoryDefinitionTest(TestCase):
+
+    def test_official_2025_identifiers_and_names(self):
+        self.assertEqual(owasp_2025.OWASP_TOP10_2025, _OFFICIAL_2025)
+        self.assertEqual(len(set(owasp_2025.OWASP_TOP10_2025)), 10)
+
+    def test_edition_distinguishes_historical_and_current_labels(self):
+        self.assertEqual(owasp_2025.owasp_edition('A05:2021 - Security Misconfiguration'), '2021')
+        self.assertEqual(owasp_2025.owasp_edition('A05:2025 - Injection'), '2025')
+        for value in (None, '', 'CWE-79', 'Injection', 'A11:2025 - Foo'):
+            self.assertIsNone(owasp_2025.owasp_edition(value))
+        self.assertFalse(owasp_2025.is_owasp_2025('A03:2021 - Injection'))
+        self.assertTrue(owasp_2025.is_owasp_2025(_A05))
+
+
+class OwaspFindingMappingTest(TestCase):
+    """Bulgu bazında eşleme: her owasp değeri ya resmi 2025 kategorisi ya da None."""
+
+    def test_every_finding_label_is_official_2025_or_unmapped(self):
+        rows = _finding_mappings()
+        self.assertGreater(len(rows), 80)
+        for module, title, owasp_values, _cwe in rows:
+            for value in owasp_values:
+                with self.subTest(module=module, title=title):
+                    self.assertTrue(value is None or value in _OFFICIAL_2025, value)
+
+    def test_no_obsolete_2021_labels_in_scanner_code(self):
+        label = _re.compile(r'^A(?:0[1-9]|10):(\d{4}) - ')
+        for path in _SCANNER_DIR.glob('*.py'):
+            for node in ast.walk(ast.parse(path.read_text(encoding='utf-8'))):
+                if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    match = label.match(node.value)
+                    with self.subTest(module=path.name, value=node.value[:40]):
+                        self.assertTrue(match is None or match.group(1) == '2025')
+
+    def test_a03_a06_a09_are_never_assigned(self):
+        """A06/A09 dış taramayla değerlendirilemez; A03 için tedarik zinciri kanıtı üretilmez."""
+        assigned = {v for _m, _t, owasp_values, _c in _finding_mappings() for v in owasp_values}
+        self.assertFalse(assigned & {_A03, _A06, _A09})
+
+    def test_finding_level_mappings(self):
+        expected = [
+            # (modül, başlık parçası, OWASP 2025, CWE)
+            ('sql', 'Potential SQL Injection - Database Error Triggered', _A05, 'CWE-89'),
+            ('xss', 'Potential Reflected XSS', _A05, 'CWE-79'),
+            ('cmd', 'Potential OS Command Injection - Shell Error', _A05, 'CWE-78'),
+            ('nosql', 'Potential NoSQL Injection - Database Error Triggered', _A05, 'CWE-943'),
+            ('access_control', 'CORS: Wildcard + credentials', _A01, 'CWE-942'),
+            ('access_control', 'Potentially Insecure CORS Origin Reflection', _A01, 'CWE-942'),
+            ('access_control', 'Dizin Listeleme', _A01, 'CWE-548'),
+            ('access_control', 'Cookie HttpOnly eksik', _A02, 'CWE-1004'),
+            ('access_control', 'Cookie Secure eksik', _A02, 'CWE-614'),
+            ('access_control', 'Cookie SameSite eksik', _A01, 'CWE-1275'),
+            ('access_control', 'HTTP TRACE aktif', _A02, None),
+            ('auth', 'Login sayfası HTTP üzerinde', _A04, 'CWE-319'),
+            ('auth', 'Authentication Form Uses Unencrypted Transport', _A04, 'CWE-523'),
+            ('auth', 'Potential Lack of Authentication Rate Limiting', _A07, 'CWE-307'),
+            ('ssl_tls', 'Zayıf protokol', _A04, 'CWE-327'),
+            ('ssl_tls', 'Yetersiz anahtar uzunluğu', _A04, 'CWE-326'),
+            ('ssl_tls', 'Self-signed sertifika', _A04, 'CWE-295'),
+            ('ssl_tls', 'Sertifika süresi dolmuş', _A04, 'CWE-324'),
+            ('ssl_tls', 'HTTPS mevcut ama kullanılmıyor', _A04, 'CWE-319'),
+            ('headers', 'HSTS max-age yetersiz', _A04, 'CWE-693'),
+            ('headers', 'HSTS includeSubDomains eksik', _A04, None),
+            ('headers', "CSP 'unsafe-inline'", _A02, 'CWE-693'),
+            ('integrity', 'SRI eksik', _A08, 'CWE-829'),
+            ('integrity', 'CSP olmadan inline <script>', _A02, None),
+            ('integrity', 'Hata log dosyası erişilebilir', _A01, 'CWE-538'),
+            ('integrity', 'Dependency Metadata Exposed', _A01, 'CWE-538'),
+            ('cms', 'Hassas dosya erişilebilir', _A01, 'CWE-538'),
+            ('error_disclosure', 'Application Debug Mode Exposed', _A02, 'CWE-489'),
+            ('error_disclosure', 'Application Stack Trace Disclosure', _A10, 'CWE-209'),
+            ('error_disclosure', 'Sensitive Data Potentially Exposed in API Documentation', _A01, 'CWE-200'),
+        ]
+        for module, fragment, owasp_label, cwe in expected:
+            with self.subTest(module=module, finding=fragment):
+                for owasp_values, cwe_values in _mapping(module, fragment):
+                    self.assertEqual(owasp_values, {owasp_label})
+                    self.assertEqual(cwe_values, {cwe})
+
+    def test_default_credential_findings_map_to_a07_with_cwe_1392(self):
+        # auth.py'de başlığı değişkenden gelen bulgular: varsayılan kimlik bilgisi (A07 / CWE-1392),
+        # rate-limit SECURE kontrol yanıtı ve NOT_EXECUTED (ikisi de kategorisiz)
+        variable_titled = [(o, c) for m, t, o, c in _finding_mappings() if m == 'auth' and t == 'title']
+        self.assertIn(({_A07}, {'CWE-1392'}), variable_titled)
+        self.assertTrue(all(o in ({_A07}, {None}) for o, _c in variable_titled))
+
+    def test_monitoring_endpoint_is_a02_and_info_reachability_is_unmapped(self):
+        # 401/403 korumalı uç (yalnızca var olduğu bilinir) → kategori yok; erişilebilir uç → A02,
+        # salt-durum (INFO) yanıtı → kategori yok
+        variants = [o for o, _c in _mapping('error_disclosure', "İzleme endpoint'i bulundu")]
+        self.assertEqual(len(variants), 2)
+        self.assertIn({None}, variants)
+        self.assertIn({None, _A02}, variants)
+
+    def test_unmapped_findings_remain_unmapped(self):
+        """Teknoloji keşfi, erişilebilirlik ve OWASP Top 10 dışı altyapı bulguları zorla eşlenmez."""
+        for module, fragment in (('cms', 'Generator meta tag'), ('cms', 'Sürüm bilgisi'),
+                                 ('headers', 'bilgi sızdırıyor'), ('dns_scan', 'SPF'),
+                                 ('dns_scan', 'DMARC'), ('dns_scan', 'Zone Transfer')):
+            with self.subTest(module=module, finding=fragment):
+                for owasp_values, _cwe in _mapping(module, fragment):
+                    self.assertEqual(owasp_values, {None})
+        dns_rows = [o for m, _t, o, _c in _finding_mappings() if m == 'dns_scan']
+        self.assertTrue(dns_rows)
+        self.assertTrue(all(values == {None} for values in dns_rows))
+
+    def test_not_executed_and_not_assessed_findings_carry_no_category(self):
+        """Yürütülmeyen / değerlendirilmeyen testler kapsam sayılmaz (OWASP etiketi yok)."""
+        guard_rows = [o for m, t, o, _c in _finding_mappings() if m == 'credential_guard']
+        self.assertEqual(guard_rows, [{None}])
+        finding = not_assessed_finding('https://e.example/login', 'parola alanı')
+        self.assertIsNone(finding.owasp)
+        not_executed = AuthScanner._not_executed('Rate-limit testi yürütülmedi', 'r', 'https://e.example/', 's')
+        self.assertIsNone(not_executed.owasp)
+
+
+class OwaspBehavioralMappingTest(TestCase):
+    """Davranışsal örnekler: gerçek scanner çıktısındaki eşleme."""
+
+    @patch('Tarama.scanners.headers.requests.Session')
+    def test_header_findings(self, MockSession):
+        session = MagicMock()
+        session.get.return_value = MagicMock(status_code=200, reason='OK', headers={'Server': 'Apache/2.4.1'})
+        MockSession.return_value = session
+        result = HeaderScanner().scan('https://example.com')
+        by_title = {f.title: f for f in result.findings}
+        self.assertEqual((by_title['Strict-Transport-Security eksik'].owasp,
+                          by_title['Strict-Transport-Security eksik'].cwe), (_A04, 'CWE-693'))
+        self.assertEqual(by_title['Content-Security-Policy eksik'].owasp, _A02)
+        self.assertEqual(by_title['X-Frame-Options eksik'].owasp, _A02)
+        self.assertIsNone(by_title['X-XSS-Protection eksik'].owasp)      # kullanımdan kalkmış header
+        self.assertIsNone(by_title['Server bilgi sızdırıyor'].owasp)     # teknoloji keşfi
+        # Severity / status değişmedi
+        self.assertEqual((by_title['Server bilgi sızdırıyor'].severity, by_title['Server bilgi sızdırıyor'].status),
+                         (Severity.LOW, FindingStatus.CONFIRMED))
+
+    def test_port_findings(self):
+        scanner = PortScanner()
+        redis = scanner._build_open_finding('https://example.com', 6379, 'Redis', Severity.HIGH, 'ev', '+PONG')
+        self.assertEqual((redis.owasp, redis.cwe, redis.status), (_A07, 'CWE-306', FindingStatus.CONFIRMED))
+        telnet = scanner._build_open_finding('https://example.com', 23, 'Telnet', Severity.HIGH, 'ev', '')
+        self.assertEqual((telnet.owasp, telnet.cwe), (_A04, 'CWE-319'))
+        mysql = scanner._build_open_finding('https://example.com', 3306, 'MySQL', Severity.MEDIUM, 'ev', '')
+        self.assertIsNone(mysql.owasp)                                    # yalnızca erişilebilirlik
+        self.assertEqual(mysql.status, FindingStatus.MANUAL_REVIEW)
+
+    def test_dns_findings_are_not_forced_into_owasp(self):
+        scanner = DnsScanner()
+        scanner._query = MagicMock(return_value=[])
+        result = scanner.scan('https://example.com')
+        self.assertTrue(result.findings)
+        self.assertTrue(all(f.owasp is None for f in result.findings))
+
+    @patch('Tarama.scanners.sql.requests.Session')
+    def test_injection_finding_serializes_2025_label(self, MockSession):
+        instance = MockSession.return_value
+        instance.get.return_value.content = b'<form action="/search" method="post"><input name="q"></form>'
+
+        def post(*args, **kwargs):
+            resp = MagicMock()
+            resp.content = (b'ok' if kwargs.get('data', {}).get('q') == 'lilith_baseline'
+                            else b'you have an error in your sql syntax')
+            return resp
+        instance.post.side_effect = post
+        finding = next(f for f in SqlInjectionScanner().scan('https://example.com').findings
+                       if 'Database Error' in f.title)
+        self.assertEqual(finding.to_dict()['owasp'], _A05)
+        self.assertEqual(owasp_2025.owasp_edition(finding.to_dict()['owasp']), '2025')
+
+
+class OwaspHistoricalCompatibilityTest(TestCase):
+    """P0-5 öncesi kayıtlar 2021 dizgilerini korur; API/UI ikisini de değiştirmeden döndürür."""
+
+    def test_historical_2021_and_new_2025_labels_coexist_without_collision(self):
+        job = ScanJob.objects.create(target='https://example.com', status='DONE')
+        ScanFinding.objects.create(job=job, scanner='headers', severity='LOW', title='Eski bulgu',
+                                   status='CONFIRMED', owasp='A05:2021 - Security Misconfiguration')
+        ScanFinding.objects.create(job=job, scanner='sql', severity='HIGH', title='Yeni bulgu',
+                                   status='POTENTIAL', owasp=_A05)
+        ScanFinding.objects.create(job=job, scanner='dns', severity='MEDIUM', title='Eşlenmemiş',
+                                   status='CONFIRMED', owasp='')
+        res = Client().get(f'/api/scan/{job.id}/')
+        self.assertEqual(res.status_code, 200)
+        labels = {f['title']: f['owasp'] for f in res.json()['findings']}
+        self.assertEqual(labels['Eski bulgu'], 'A05:2021 - Security Misconfiguration')   # migrasyon yok
+        self.assertEqual(labels['Yeni bulgu'], 'A05:2025 - Injection')
+        self.assertIsNone(labels['Eşlenmemiş'])                                          # API sözleşmesi aynı
+        self.assertEqual(owasp_2025.owasp_edition(labels['Eski bulgu']), '2021')
+        self.assertEqual(owasp_2025.owasp_edition(labels['Yeni bulgu']), '2025')
+        # Aynı "A05" öneki iki farklı kategori — tam etiket korunduğu için karışmaz
+        self.assertNotEqual(labels['Eski bulgu'], labels['Yeni bulgu'])
+
+    def test_ui_renders_full_owasp_label_verbatim(self):
+        template = (pathlib.Path(__file__).resolve().parent / 'templates' / 'Baslangic' / 'Ana.html').read_text(
+            encoding='utf-8')
+        self.assertIn("$('#fdOwasp').text(finding.owasp || '')", template)   # yıl dahil tam etiket
+        self.assertIn('f.owasp', template)                                    # aramada kullanılmaya devam eder

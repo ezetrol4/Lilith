@@ -17,12 +17,14 @@ from difflib import SequenceMatcher
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from .credential_guard import credential_endpoint_reason, credential_form_reason, not_assessed_finding
 from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
 
-_OWASP_INJECTION = "A03:2021 - Injection"
+# CWE-943 resmi A05:2025 CWE listesinde yok; A05 açıklaması NoSQL injection'ı açıkça adlandırır
+_OWASP_INJECTION = owasp_2025.A05_INJECTION
 _CWE_NOSQLI = "CWE-943"
 
 

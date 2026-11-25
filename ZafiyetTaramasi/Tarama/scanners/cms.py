@@ -4,6 +4,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.evidence_redaction import redact_then_truncate
 from ..services.path_baseline import PathBaseline, Relation
 from ..services.safe_http import SafeSession, safe_session
@@ -14,7 +15,9 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-_OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
+# Web kökünde hassas dosya: CWE-538 → A01 ("ensure file metadata (e.g., .git) and backup files
+# are not present within web roots"). Sürüm/generator ifşası teknoloji keşfidir → kategori yok.
+_OWASP_FILE_EXPOSURE = owasp_2025.A01_BROKEN_ACCESS_CONTROL
 _CWE_SENSITIVE_FILE = "CWE-538"  # Insertion of Sensitive Information into Externally-Accessible File or Directory
 
 # CMS parmak izi: (pattern, cms_name, confidence) — generator/JS-marker imzaları yol-tabanlı imzalardan daha güvenilir
@@ -207,7 +210,6 @@ class CmsScanner(Scanner):
                             "informational version disclosure, not a confirmed vulnerability — no CVE is "
                             "inferred from this string.",
                 affected_url=target,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Remove or genericize the generator meta tag if minimizing fingerprinting is desired.",
             ))
 
@@ -238,7 +240,6 @@ class CmsScanner(Scanner):
                             "(readme/license/changelog) is not a vulnerability; this is reported as "
                             "informational reconnaissance data, not a confirmed exploitable weakness.",
                 affected_url=base + path,
-                owasp=_OWASP_MISCONFIG if version else None,
                 cwe="CWE-200" if version else None,
             ))
 
@@ -268,7 +269,7 @@ class CmsScanner(Scanner):
                                 f"{description.lower()}, indicating genuine exposure rather than a generic "
                                 "catch-all response.",
                     affected_url=base + path,
-                    owasp=_OWASP_MISCONFIG,
+                    owasp=_OWASP_FILE_EXPOSURE,
                     cwe=_CWE_SENSITIVE_FILE,
                     recommendation=f"Remove or restrict public access to {path}; it should not be served "
                                    "from the web root.",

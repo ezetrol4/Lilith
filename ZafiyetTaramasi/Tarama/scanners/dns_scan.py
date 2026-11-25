@@ -12,7 +12,6 @@ from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingSta
 from ..services.safe_socket import OutboundConnectionBlocked, check_public_address
 
 
-_OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
 _CWE_INFO_EXPOSURE = "CWE-200"  # Exposure of Sensitive Information to an Unauthorized Actor
 
 _DKIM_SELECTORS = ["default", "google", "mail", "k1", "selector1", "selector2", "dkim"]
@@ -136,7 +135,6 @@ class DnsScanner(Scanner):
                             "servers have no way to verify which hosts are authorized to send mail on "
                             "its behalf.",
                 affected_url=domain,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Publish an SPF TXT record listing authorized sending hosts, ending in "
                                "-all (or ~all while validating sources).",
             ))
@@ -162,7 +160,6 @@ class DnsScanner(Scanner):
                 description="This SPF record ends in +all, which explicitly authorizes any host on the "
                             "internet to send mail as this domain.",
                 affected_url=domain,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Replace +all with -all (or at minimum ~all) to prevent arbitrary senders "
                                "from spoofing this domain.",
             ))
@@ -176,7 +173,6 @@ class DnsScanner(Scanner):
                 description="This SPF record ends in ?all (neutral), so receiving servers make no "
                             "determination about unauthorized senders based on SPF alone.",
                 affected_url=domain,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Move to ~all or -all once legitimate sending sources are fully identified.",
             ))
         elif "~all" in spf_lower:
@@ -189,7 +185,6 @@ class DnsScanner(Scanner):
                 description="This SPF record ends in ~all (SoftFail), so unauthorized senders are marked "
                             "as suspicious rather than rejected outright.",
                 affected_url=domain,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Consider migrating to -all once all legitimate sending sources are "
                                "confirmed, for a stronger fail policy.",
             ))
@@ -220,7 +215,6 @@ class DnsScanner(Scanner):
                             "is no policy telling receiving servers how to handle mail that fails "
                             "SPF/DKIM checks.",
                 affected_url=domain,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Publish a DMARC record (starting with p=none for monitoring) and "
                                "gradually move to p=quarantine or p=reject.",
             ))
@@ -248,7 +242,6 @@ class DnsScanner(Scanner):
                             "as having no DMARC record — reports are collected but spoofed mail is not "
                             "yet blocked.",
                 affected_url=domain,
-                owasp=_OWASP_MISCONFIG,
                 recommendation="Monitor authentication results before moving toward quarantine/reject, "
                                "according to the organization's mail architecture.",
             ))
@@ -340,7 +333,6 @@ class DnsScanner(Scanner):
                         description=f"Name server {ns_host} allowed a full AXFR zone transfer, exposing "
                                     "the domain's internal DNS record layout to anyone who asks.",
                         affected_url=domain,
-                        owasp=_OWASP_MISCONFIG,
                         cwe=_CWE_INFO_EXPOSURE,
                         recommendation="Restrict AXFR zone transfers to authorized secondary name servers only.",
                     ))

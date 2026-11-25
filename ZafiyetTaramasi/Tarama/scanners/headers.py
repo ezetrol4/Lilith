@@ -3,13 +3,20 @@ import requests
 from urllib.parse import urlparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from . import owasp as owasp_2025
 from ..services.safe_http import safe_session
 
 
-_OWASP_MISCONFIG = "A05:2021 - Security Misconfiguration"
+# P0-5: güvenlik header'ları A02 açıklamasında açıkça adlandırılır ("does not send security
+# headers or directives"); HSTS ise A04 önleme metninde ("enforce ... HSTS") → A04.
+_OWASP_MISCONFIG = owasp_2025.A02_SECURITY_MISCONFIGURATION
+_OWASP_TRANSPORT = owasp_2025.A04_CRYPTOGRAPHIC_FAILURES
 _CWE_PROTECTION_FAILURE = "CWE-693"    # Protection Mechanism Failure
 _CWE_CLICKJACKING = "CWE-1021"         # Improper Restriction of Rendered UI Layers or Frames
 _CWE_INFO_EXPOSURE = "CWE-200"         # Exposure of Sensitive Information to an Unauthorized Actor
+# HSTS bulguları için CWE-693: gözlenen şey eksik/zayıf bir koruma mekanizmasıdır. CWE-523
+# (kimlik bilgisinin korumasız taşınması) burada KANITLANMAZ — header kontrolü kimlik bilgisi
+# taşınmasını gözlemlemez. A04 ataması Lilith'in kategori metni yorumudur (resmi CWE listesi değil).
 
 # header adı -> (eksikken severity, description, recommendation, cwe)
 _MISSING_HEADER_INFO: dict[str, tuple[Severity, str, str, str | None]] = {
@@ -64,6 +71,13 @@ _MISSING_HEADER_INFO: dict[str, tuple[Severity, str, str, str | None]] = {
         "X-XSS-Protection header.",
         None,
     ),
+}
+
+# Eksik header → OWASP kategorisi (varsayılan A02). X-XSS-Protection kullanımdan kalkmıştır;
+# yokluğunun güvenlik etkisi yoktur → kategori atanmaz.
+_MISSING_HEADER_OWASP: dict[str, str | None] = {
+    "Strict-Transport-Security": _OWASP_TRANSPORT,
+    "X-XSS-Protection": None,
 }
 
 # Varlığı bilgi sızdırma anlamına gelen headerlar
@@ -142,7 +156,7 @@ class HeaderScanner(Scanner):
                 status=FindingStatus.CONFIRMED,
                 description=description,
                 affected_url=target,
-                owasp=_OWASP_MISCONFIG,
+                owasp=_MISSING_HEADER_OWASP.get(name, _OWASP_MISCONFIG),
                 cwe=cwe,
                 recommendation=recommendation,
             ))
@@ -159,7 +173,7 @@ class HeaderScanner(Scanner):
                     description=f"The {name} header discloses server/framework version information that "
                                 "can help an attacker fingerprint the technology stack.",
                     affected_url=target,
-                    owasp=_OWASP_MISCONFIG,
+                    # P0-5: sürüm ifşası teknoloji keşfidir, tek başına zafiyet değil → kategori yok
                     cwe=_CWE_INFO_EXPOSURE,
                     recommendation=f"Suppress or generalize the {name} header at the web server/proxy level.",
                 ))
@@ -191,7 +205,7 @@ class HeaderScanner(Scanner):
                     description="The HSTS max-age is shorter than one year, so browsers stop enforcing "
                                 "HTTPS for this host sooner than recommended.",
                     affected_url=target,
-                    owasp=_OWASP_MISCONFIG,
+                    owasp=_OWASP_TRANSPORT,
                     cwe=_CWE_PROTECTION_FAILURE,
                     recommendation="Increase Strict-Transport-Security max-age to at least 31536000 (1 year).",
                 ))
@@ -205,7 +219,7 @@ class HeaderScanner(Scanner):
                 description="The Strict-Transport-Security header is present but has no max-age directive, "
                             "so browsers cannot determine how long to enforce HTTPS.",
                 affected_url=target,
-                owasp=_OWASP_MISCONFIG,
+                owasp=_OWASP_TRANSPORT,
                 cwe=_CWE_PROTECTION_FAILURE,
                 recommendation="Add a max-age directive of at least 31536000 seconds to the "
                                "Strict-Transport-Security header.",
@@ -220,7 +234,7 @@ class HeaderScanner(Scanner):
                 description="The Strict-Transport-Security header does not include includeSubDomains, so "
                             "subdomains are not covered by HSTS enforcement.",
                 affected_url=target,
-                owasp=_OWASP_MISCONFIG,
+                owasp=_OWASP_TRANSPORT,
                 recommendation="Add includeSubDomains to the Strict-Transport-Security header if all "
                                "subdomains are served over HTTPS.",
             ))
