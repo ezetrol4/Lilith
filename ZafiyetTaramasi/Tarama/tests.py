@@ -2750,7 +2750,7 @@ class CmdInjectionScannerTest(TestCase):
         ])
         mock_time.side_effect = lambda: next(times, 999.0)
 
-        result = CmdInjectionScanner().scan('https://example.com')
+        result = CmdInjectionScanner(time_based_probes=True).scan('https://example.com')  # P0-6: lab-only
 
         time_findings = [f for f in result.findings if 'Blind Command Injection' in f.title]
         self.assertTrue(len(time_findings) > 0)
@@ -2772,7 +2772,7 @@ class CmdInjectionScannerTest(TestCase):
         ])
         mock_time.side_effect = lambda: next(times, 999.0)
 
-        result = CmdInjectionScanner().scan('https://example.com')
+        result = CmdInjectionScanner(time_based_probes=True).scan('https://example.com')  # P0-6: lab-only
 
         time_findings = [f for f in result.findings if 'Blind Command Injection' in f.title]
         self.assertTrue(len(time_findings) > 0)
@@ -7354,3 +7354,234 @@ class OwaspHistoricalCompatibilityTest(TestCase):
             encoding='utf-8')
         self.assertIn("$('#fdOwasp').text(finding.owasp || '')", template)   # yıl dahil tam etiket
         self.assertIn('f.owasp', template)                                    # aramada kullanılmaya devam eder
+
+
+# ---------------------------------------------------------------------------
+# P0-6: Komut enjeksiyonu kanıt sertleştirmesi (scanners/cmd.py)
+# Gerçek requests.Response; ağ/DNS yok; tüm değerler SAHTEDİR.
+# ---------------------------------------------------------------------------
+
+import html
+from urllib.parse import quote
+
+from .scanners import cmd as cmd_module
+
+_CMD_FORM = '<html><body><form action="/ping" method="post"><input name="host"></form></body></html>'
+_PASSWD_OUTPUT = ('root:x:0:0:root:/root:/bin/bash\n'
+                  'daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n'
+                  'www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin')
+_ID_OUTPUT = 'uid=33(www-data) gid=33(www-data) groups=33(www-data)'
+_WININI_OUTPUT = '; for 16-bit app support\n[fonts]\n[extensions]\n[mci extensions]\n[files]'
+_CMD_FINDING_STATUSES = (FindingStatus.CONFIRMED, FindingStatus.POTENTIAL, FindingStatus.MANUAL_REVIEW)
+
+
+class _CmdApp:
+    """POST /ping: respond(host) → (status, text) | Exception. Tüm gönderimler kaydedilir."""
+
+    def __init__(self, respond):
+        self.respond = respond
+        self.posts: list[str] = []
+
+    def post(self, url, data=None, **kwargs):
+        value = (data or {}).get('host', '')
+        self.posts.append(value)
+        outcome = self.respond(value)
+        if isinstance(outcome, Exception):
+            raise outcome
+        status, text = outcome
+        return _http_response(status, text, url=url)
+
+
+def _is_payload(value: str, *fragments) -> bool:
+    return any(fragment in value for fragment in fragments)
+
+
+@patch('Tarama.scanners.cmd.requests.Session')
+class CmdEvidenceHardeningTest(TestCase):
+
+    def _scan(self, MockSession, app, target='https://example.com', **scanner_kwargs):
+        instance = MockSession.return_value
+        instance.get.side_effect = lambda url, **kw: _http_response(200, _CMD_FORM, url=url)
+        instance.post.side_effect = app.post
+        return CmdInjectionScanner(**scanner_kwargs).scan(target)
+
+    @staticmethod
+    def _cmd_findings(result):
+        return [f for f in result.findings if f.status in _CMD_FINDING_STATUSES]
+
+    def _assert_never_confirmed(self, result):
+        self.assertFalse([f for f in result.findings if f.status == FindingStatus.CONFIRMED])
+
+    # --- Doğru pozitifler korunur -----------------------------------------------------
+
+    def test_structured_output_with_reproduction_is_confirmed(self, MockSession):
+        for family, fragment, output in (('passwd', 'passwd', _PASSWD_OUTPUT), ('id', 'id', _ID_OUTPUT),
+                                         ('win.ini', 'win.ini', _WININI_OUTPUT)):
+            with self.subTest(family=family):
+                secret_tail = '\nDB_PASSWORD=FakeHunter2Secret'
+                app = _CmdApp(lambda v, _f=fragment, _o=output: (200, f'<pre>{_o}{secret_tail}</pre>')
+                              if _f in v and v != 'lilith_baseline' else (200, '<html>OK</html>'))
+                result = self._scan(MockSession, app)
+                confirmed = [f for f in result.findings if f.status == FindingStatus.CONFIRMED]
+                self.assertEqual(len(confirmed), 1)
+                self.assertEqual((confirmed[0].title, confirmed[0].severity, confirmed[0].confidence),
+                                 ('OS Command Execution Confirmed', Severity.CRITICAL, Confidence.HIGH))
+                self.assertEqual(confirmed[0].mitre, 'T1059 - Command and Scripting Interpreter')
+                self.assertNotIn('FakeHunter2Secret', confirmed[0].evidence)   # P0-2 redaksiyonu korunur
+
+    def test_structured_output_not_reproduced_is_potential(self, MockSession):
+        calls = itertools.count()
+
+        def respond(value):
+            if 'passwd' in value and next(calls) == 0:
+                return 200, f'<pre>{_PASSWD_OUTPUT}</pre>'
+            return 200, '<html>OK</html>'
+        result = self._scan(MockSession, _CmdApp(respond))
+        found = self._cmd_findings(result)
+        self.assertEqual([(f.status, f.confidence) for f in found], [(FindingStatus.POTENTIAL, Confidence.MEDIUM)])
+        self.assertIn('Output Based', found[0].title)
+
+    # --- Genel işaretler / yansıma / hata sayfaları yürütme kanıtı değildir -----------
+
+    def test_generic_markers_do_not_confirm_execution(self, MockSession):
+        """Önceden: tekrarlanan '/bin/' veya 'uid=' → CRITICAL / CONFIRMED."""
+        pages = {
+            'bin_daemon': '<html>Usage: /bin/ping HOST — ping daemon: unavailable</html>',
+            'bare_uid': '<html><a href="/profile?uid=42">Profile</a> groups=admins</html>',
+            'lone_root_line': '<html>Format example: root:x:0:0 is the superuser entry.</html>',
+            'single_ini_section': '<html>Section [fonts] not configured.</html>',
+        }
+        for name, page in pages.items():
+            with self.subTest(page=name):
+                app = _CmdApp(lambda v, _p=page: (200, '<html>OK</html>') if v == 'lilith_baseline' else (200, _p))
+                result = self._scan(MockSession, app)
+                self._assert_never_confirmed(result)
+                found = self._cmd_findings(result)
+                self.assertEqual(len(found), 1)
+                self.assertEqual((found[0].status, found[0].confidence), (FindingStatus.MANUAL_REVIEW, Confidence.LOW))
+                self.assertIn('Ambiguous Output Marker', found[0].title)
+
+    def test_reflected_input_does_not_confirm_execution(self, MockSession):
+        def respond(value):
+            return 200, f'<html>You entered: {value} / {html.escape(value)} / {quote(value, safe="")}</html>'
+        result = self._scan(MockSession, _CmdApp(respond))
+        self.assertEqual(self._cmd_findings(result), [])
+        # Yansıyan yapılandırılmış metin de kanıt değildir
+        stripped = cmd_module._without_reflection(f'echo: {html.escape(_ID_OUTPUT)}', _ID_OUTPUT)
+        self.assertIsNone(cmd_module._structured_output(cmd_module._ID, stripped))
+
+    def test_ordinary_error_pages_do_not_confirm_or_suggest_execution(self, MockSession):
+        pages = {
+            'missing_file': (500, '<html>Warning: include(/usr/bin/x): No such file or directory</html>'),
+            'permission': (500, '<html>Error: Permission denied</html>'),
+            'commit_hash': (200, '<html>Build hash: 9f8e7d · refresh: 30s</html>'),
+            'generic_500': (500, '<html>500 Internal Server Error</html>'),
+        }
+        for name, page in pages.items():
+            with self.subTest(page=name):
+                app = _CmdApp(lambda v, _p=page: (200, '<html>OK</html>') if v == 'lilith_baseline' else _p)
+                result = self._scan(MockSession, app)
+                self._assert_never_confirmed(result)
+                self.assertFalse([f for f in result.findings if f.status == FindingStatus.POTENTIAL])
+                for finding in self._cmd_findings(result):
+                    self.assertEqual(finding.status, FindingStatus.MANUAL_REVIEW)
+
+    def test_structured_shell_error_stays_potential(self, MockSession):
+        app = _CmdApp(lambda v: (200, '<html>OK</html>') if v == 'lilith_baseline'
+                      else (500, 'sh: 1: lilith: not found'))
+        found = self._cmd_findings(self._scan(MockSession, app))
+        self.assertEqual([(f.status, f.confidence) for f in found], [(FindingStatus.POTENTIAL, Confidence.MEDIUM)])
+        self.assertIn('Shell Error', found[0].title)
+
+    # --- WAF / HTTP semantiği ---------------------------------------------------------
+
+    def test_waf_responses_never_confirm_and_stop_all_probes(self, MockSession):
+        for name, response in {'403': (403, '<html>Forbidden</html>'),
+                               '429': (429, 'Too Many Requests'),
+                               'challenge_200': (200, '<html>Attention Required! Verify you are human</html>')}.items():
+            with self.subTest(waf=name):
+                app = _CmdApp(lambda v, _r=response: (200, '<html>OK</html>') if v == 'lilith_baseline' else _r)
+                result = self._scan(MockSession, app)
+                self.assertEqual(self._cmd_findings(result), [])
+                self.assertEqual(len(app.posts), 2)                       # baseline + ilk payload, sonra DUR
+                blocked = next(f for f in result.findings
+                               if f.title == 'Komut enjeksiyonu testi durduruldu: engelleme yanıtı')
+                self.assertEqual(blocked.status, FindingStatus.INFORMATIONAL)
+                self.assertIn('Sonuç: BLOCKED', blocked.evidence)
+                self.assertFalse([f for f in result.findings if f.status == FindingStatus.SECURE])
+
+    def test_http_error_baseline_is_a_real_baseline(self, MockSession):
+        """Önceden: 500 baseline falsy → '' sayılıyor, aynı shell hatası 'yeni' bulgu oluyordu (§67)."""
+        app = _CmdApp(lambda v: (500, '<pre>sh: 1: ping: not found\n/bin/sh: 1: syntax error</pre>'))
+        result = self._scan(MockSession, app)
+        self.assertEqual(self._cmd_findings(result), [])
+
+    def test_missing_baseline_is_distinct_from_http_error(self, MockSession):
+        """Yanıt yoksa 'yeni' kanıt kurulamaz → alan test edilmez (önceden baseline '' → CONFIRMED)."""
+        app = _CmdApp(lambda v: requests.ConnectionError('down') if v == 'lilith_baseline'
+                      else (200, f'<pre>{_PASSWD_OUTPUT}</pre>'))
+        result = self._scan(MockSession, app)
+        self.assertEqual(self._cmd_findings(result), [])
+        self.assertFalse([v for v in app.posts if 'passwd' in v])         # payload gönderilmedi
+
+    def test_url_parameter_error_and_waf_handling(self, MockSession):
+        instance = MockSession.return_value
+
+        def get_side(url, **kw):
+            if 'lilith_baseline' in url or url.endswith('?cmd=ping'):
+                return _http_response(200, '<html>No forms</html>', url=url)
+            return _http_response(403, '<html>Forbidden</html>', url=url)
+        instance.get.side_effect = get_side
+        result = CmdInjectionScanner().scan('https://example.com?cmd=ping')
+        self.assertEqual(self._cmd_findings(result), [])
+        self.assertIn('Komut enjeksiyonu testi durduruldu: engelleme yanıtı', [f.title for f in result.findings])
+
+    # --- Güvenlik: zaman bazlı yoklamalar varsayılan KAPALI ---------------------------
+
+    def test_time_based_probes_not_executed_by_default(self, MockSession):
+        app = _CmdApp(lambda v: (200, '<html>OK</html>'))
+        result = self._scan(MockSession, app)
+        self.assertFalse([v for v in app.posts if _is_payload(v, 'sleep', 'ping -', 'timeout /t')])
+        skipped = next(f for f in result.findings
+                       if f.title == 'Kör (zaman bazlı) komut enjeksiyonu testi yürütülmedi')
+        self.assertEqual(skipped.status, FindingStatus.INFORMATIONAL)
+        self.assertIn('Sonuç: NOT_EXECUTED', skipped.evidence)
+        self.assertIsNone(skipped.owasp)
+        self.assertFalse([f for f in result.findings if f.status == FindingStatus.SECURE])
+        # Alan başına sınırlı istek: 2 baseline + 11 çıktı + 6 hata payload'ı
+        self.assertEqual(len(app.posts), 2 + len(cmd_module._OUTPUT_PAYLOADS) + 6)
+
+    def test_time_based_flag_is_code_only_and_typed(self, MockSession):
+        for value in ('true', 1, 'yes'):
+            with self.assertRaises(TypeError):
+                CmdInjectionScanner(time_based_probes=value)
+        self.assertFalse(CmdInjectionScanner().time_based_probes)
+        package = pathlib.Path(__file__).resolve().parent
+        constructions = {}
+        for path in package.rglob('*.py'):
+            if path.name == 'tests.py' or 'migrations' in path.parts:
+                continue
+            calls = [c for c in _re.findall(r'CmdInjectionScanner\([^)]*\)', path.read_text(encoding='utf-8'))
+                     if not c.startswith('CmdInjectionScanner(Scanner')]
+            if calls:
+                constructions[path.name] = calls
+        self.assertEqual(constructions, {'orchestrator.py': ['CmdInjectionScanner()']})
+
+    @patch('Tarama.scanners.cmd.time.time')
+    def test_timeout_is_not_timing_evidence(self, mock_time, MockSession):
+        """Lab modunda bile zaman aşımı (yanıt yok) gecikme kanıtı sayılmaz."""
+        clock = itertools.count(step=13.0)
+        mock_time.side_effect = lambda: next(clock)                       # her ölçüm ~13 sn "gecikme"
+        app = _CmdApp(lambda v: requests.Timeout('slow') if _is_payload(v, 'sleep', 'ping -', 'timeout /t')
+                      else (200, '<html>OK</html>'))
+        result = self._scan(MockSession, app, time_based_probes=True)
+        self.assertFalse([f for f in result.findings if 'Blind Command Injection' in f.title])
+
+    def test_credential_forms_still_skipped(self, MockSession):
+        instance = MockSession.return_value
+        login = ('<html><form action="/login" method="post"><input name="user">'
+                 '<input type="password" name="pw"></form></html>')
+        instance.get.side_effect = lambda url, **kw: _http_response(200, login, url=url)
+        result = CmdInjectionScanner().scan('https://example.com')
+        instance.post.assert_not_called()
+        self.assertIn(NOT_ASSESSED_FORM_TITLE, [f.title for f in result.findings])
