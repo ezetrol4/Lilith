@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from .credential_guard import credential_endpoint_reason, credential_form_reason, not_assessed_finding
 from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
@@ -314,6 +315,11 @@ class NoSqlInjectionScanner(Scanner):
         """JSON gövdede operatör değerleri ile hata veya yanıt farkı tespiti."""
         if not self._looks_like_nosql_endpoint(url):
             return
+        reason = credential_endpoint_reason(url)
+        if reason:
+            # {"$ne": …} kimlik doğrulama atlatma biçimidir; auth uçlarına gönderilmez (P0-4.1)
+            result.findings.append(not_assessed_finding(url, reason, endpoint=True))
+            return
 
         # Baseline: geçersiz rastgele değerler
         baseline_body_map = {f: secrets.token_hex(8) for f in _JSON_FIELDS}
@@ -498,6 +504,12 @@ class NoSqlInjectionScanner(Scanner):
             details    = self._form_details(form)
             action_url = urljoin(target, details["action"] or target)
             method     = details["method"]
+
+            # Kimlik bilgisi işleyen formlara payload gönderilmez (P0-4.1) — değerlendirilmedi
+            reason = credential_form_reason(form, action_url)
+            if reason:
+                result.findings.append(not_assessed_finding(action_url, reason))
+                continue
 
             # Form action URL'si NoSQL endpoint mi?
             self._test_json_injection(action_url, session, result)

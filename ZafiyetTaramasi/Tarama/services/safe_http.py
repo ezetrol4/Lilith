@@ -222,7 +222,13 @@ class SafeSession:
         return self.request("HEAD", url, **kwargs)
 
     def request(self, method, url, **kwargs):
+        """`redirect_guard` (isteğe bağlı, varsayılan None — mevcut davranış): her yönlendirme
+        TAKİP EDİLMEDEN ÖNCE `guard(status, current_url, next_url)` çağrılır; istisna fırlatırsa
+        yönlendirme hedefine hiçbir istek gönderilmez ve istisna çağırana yayılır. SSRF
+        kontrollerinin yerine geçmez, onlara EK bir kısıttır (ör. kimlik doğrulama gönderiminin
+        yetkili origin dışına taşınmaması)."""
         follow = kwargs.pop("allow_redirects", True)
+        redirect_guard = kwargs.pop("redirect_guard", None)
         method = method.upper()
         current_url = url
         history = []
@@ -242,6 +248,9 @@ class SafeSession:
                 if history:
                     response.history = history
                 return response
+
+            if redirect_guard is not None:
+                redirect_guard(response.status_code, current_url, next_url)
 
             history.append(response)
             if len(history) > MAX_REDIRECTS:
