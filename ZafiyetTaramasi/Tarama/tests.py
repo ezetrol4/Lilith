@@ -24,6 +24,15 @@ from .scanners.error_disclosure import ErrorDisclosureScanner
 from .scanners.cmd import CmdInjectionScanner
 from .scanners.nosql import NoSqlInjectionScanner
 from .services.ssrf_guard import SSRFError, validate_url
+from .services.auth_safety import ActiveAuthAuthorization
+
+
+def _lab_auth(origin: str = 'https://example.com', rate_limit_probe: bool = True,
+              default_credentials: bool = True) -> ActiveAuthAuthorization:
+    """P0-4.1: aktif kimlik doğrulama testleri yalnızca kodla verilen lab yetkisiyle çalışır.
+    Mock'lu lab fixture'ları mevcut aktif kapsamı bu yetkiyle korur."""
+    return ActiveAuthAuthorization(origin, rate_limit_probe=rate_limit_probe,
+                                   default_credentials=default_credentials)
 
 
 # ---------------------------------------------------------------------------
@@ -664,7 +673,7 @@ class SqlScannerTest(TestCase):
         instance = MockSession.return_value
         instance.get.return_value.content = (
             b'<html><body>'
-            b'<form action="/login" method="post"><input name="user"></form>'
+            b'<form action="/search" method="post"><input name="user"></form>'
             b'</body></html>'
         )
 
@@ -696,7 +705,7 @@ class SqlScannerTest(TestCase):
         instance = MockSession.return_value
         instance.get.return_value.content = (
             b'<html><body>'
-            b'<form action="/login" method="post"><input name="user"></form>'
+            b'<form action="/search" method="post"><input name="user"></form>'
             b'</body></html>'
         )
         # Baseline dahil TÜM yanıtlar aynı hata metnini içeriyor (uygulamanın kendi
@@ -713,7 +722,7 @@ class SqlScannerTest(TestCase):
         instance = MockSession.return_value
         instance.get.return_value.content = (
             b'<html><body>'
-            b'<form action="/login" method="post"><input name="user"></form>'
+            b'<form action="/search" method="post"><input name="user"></form>'
             b'</body></html>'
         )
         instance.post.return_value.content = b'<html>Welcome back!</html>'
@@ -763,7 +772,7 @@ class SqlScannerTest(TestCase):
         instance = MockSession.return_value
         instance.get.return_value.content = (
             b'<html><body>'
-            b'<form action="/login" method="post"><input name="user"></form>'
+            b'<form action="/search" method="post"><input name="user"></form>'
             b'</body></html>'
         )
 
@@ -973,7 +982,7 @@ class SqlScannerTest(TestCase):
         instance = MockSession.return_value
         instance.get.return_value.content = (
             b'<html><body>'
-            b'<form action="/login" method="post">'
+            b'<form action="/search" method="post">'
             b'<input name="csrftoken" value="abc123">'
             b'<input name="username">'
             b'</form></body></html>'
@@ -1095,7 +1104,7 @@ class SqlScannerTest(TestCase):
 
         form_html = (
             b'<html><body>'
-            b'<form action="/register" method="post"><input name="username"></form>'
+            b'<form action="/profile/update" method="post"><input name="username"></form>'
             b'</body></html>'
         )
         clean_body    = b'<html><body>Registered OK</body></html>'
@@ -1141,7 +1150,7 @@ class SqlScannerTest(TestCase):
 
         form_html = (
             b'<html><body>'
-            b'<form action="/register" method="post"><input name="username"></form>'
+            b'<form action="/profile/update" method="post"><input name="username"></form>'
             b'</body></html>'
         )
         clean_body = b'<html><body>Registered OK</body></html>'
@@ -1163,7 +1172,7 @@ class SqlScannerTest(TestCase):
         def post_side_effect(url, data=None, **kwargs):
             resp = MagicMock()
             resp.content = clean_body
-            resp.url = 'https://example.com/register'  # redirect yok — url ile aynı
+            resp.url = 'https://example.com/profile/update'  # redirect yok — url ile aynı
             return resp
 
         instance.get.side_effect = get_side_effect
@@ -2294,7 +2303,7 @@ class AuthScannerTest(TestCase):
         fail.headers = {}
         instance.post.return_value = fail
 
-        result = AuthScanner().scan('https://example.com')
+        result = AuthScanner(authorization=_lab_auth()).scan('https://example.com')
 
         titles = [f.title for f in result.findings]
         self.assertIn('Potential Lack of Authentication Rate Limiting', titles)
@@ -2325,10 +2334,12 @@ class AuthScannerTest(TestCase):
 
         instance.post.side_effect = post_side_effect
 
-        result = AuthScanner().scan('https://example.com')
+        result = AuthScanner(authorization=_lab_auth()).scan('https://example.com')
 
-        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgileri geçerli')
-        self.assertEqual(finding.severity, Severity.CRITICAL)
+        # P0-4.1: yönlendirme + "welcome/dashboard" kelimesi güvenilir kimliği doğrulanmış durum
+        # kanıtı değil (çıkış kontrolü yok) — önceden CRITICAL/CONFIRMED, artık HIGH/POTENTIAL.
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgileri muhtemelen geçerli')
+        self.assertEqual((finding.severity, finding.status), (Severity.HIGH, FindingStatus.POTENTIAL))
         self.assertNotIn('admin', finding.evidence.split('Parola:')[1].split('|')[0])
 
 
@@ -2846,8 +2857,8 @@ class CmdInjectionScannerTest(TestCase):
 class NoSqlInjectionScannerTest(TestCase):
     _FORM_HTML = (
         b'<html><body>'
-        b'<form action="/login" method="post">'
-        b'<input name="username"><input name="password">'
+        b'<form action="/search" method="post">'
+        b'<input name="username"><input name="query">'
         b'</form></body></html>'
     )
 
@@ -2972,7 +2983,7 @@ class NoSqlInjectionScannerTest(TestCase):
             return r
 
         instance.post.side_effect = post_side
-        result = NoSqlInjectionScanner().scan('https://example.com/api/login')
+        result = NoSqlInjectionScanner().scan('https://example.com/api/users')
 
         high = [f for f in result.findings if f.severity == Severity.HIGH]
         self.assertTrue(len(high) > 0)
@@ -2993,7 +3004,7 @@ class NoSqlInjectionScannerTest(TestCase):
             return r
 
         instance.post.side_effect = post_side
-        result = NoSqlInjectionScanner().scan('https://example.com/api/login')
+        result = NoSqlInjectionScanner().scan('https://example.com/api/users')
 
         json_findings = [f for f in result.findings if 'JSON' in f.title and 'forms_detected' not in f.title]
         self.assertEqual(json_findings, [])
@@ -3016,7 +3027,7 @@ class NoSqlInjectionScannerTest(TestCase):
             return r
 
         instance.post.side_effect = post_side
-        result = NoSqlInjectionScanner().scan('https://example.com/api/login')
+        result = NoSqlInjectionScanner().scan('https://example.com/api/users')
 
         dangerous = [f for f in result.findings if f.severity in (Severity.HIGH, Severity.CRITICAL)]
         self.assertEqual(dangerous, [])
@@ -3481,7 +3492,7 @@ class SensitiveDataLeakageTest(TestCase):
             return resp
 
         instance.post.side_effect = post_side_effect
-        result = AuthScanner().scan('https://example.com')
+        result = AuthScanner(authorization=_lab_auth()).scan('https://example.com')
 
         for finding in result.findings:
             self.assertNotIn('SuperSecret123', finding.evidence or '')
@@ -3982,7 +3993,7 @@ class ScannerOutboundEnforcementTest(_SafeHttpTestBase):
     def test_form_action_to_host_resolving_private_never_requested(self):
         self._dns({'public.example': [_PUBLIC_IP], 'intranet.example': ['172.16.0.3']})
         transport = self._transport({
-            self._TARGET: (200, {}, self._page_with_form('https://intranet.example/api/login')),
+            self._TARGET: (200, {}, self._page_with_form('https://intranet.example/api/search')),
         })
         result = XssScanner().scan(self._TARGET)
         self.assertIsNone(result.error)
@@ -5839,7 +5850,7 @@ class AuthRateLimitResponseTruthinessTest(TestCase):
         instance.get.side_effect = _routes({'example.com': (200, _HOME_WITH_LOGIN)})
         instance.post.side_effect = lambda url, **kw: _http_response(post_status, 'slow down', url=url,
                                                                     headers=headers)
-        return AuthScanner().scan('https://example.com')
+        return AuthScanner(authorization=_lab_auth()).scan('https://example.com')
 
     @patch('Tarama.scanners.auth.requests.Session')
     def test_429_reaches_rate_limit_status_branch(self, MockSession):
@@ -5861,7 +5872,7 @@ class AuthRateLimitResponseTruthinessTest(TestCase):
         instance = MockSession.return_value
         instance.get.side_effect = _routes({'example.com': (200, _HOME_WITH_LOGIN)})
         instance.post.side_effect = requests.ConnectionError('down')
-        result = AuthScanner().scan('https://example.com')
+        result = AuthScanner(authorization=_lab_auth()).scan('https://example.com')
         titles = [f.title for f in result.findings]
         self.assertNotIn('Rate-limit koruması aktif (HTTP status)', titles)
         # P0-4: hiç yanıt gözlemlenmediğinde "rate limiting yok" da iddia edilemez — eskiden
@@ -5949,7 +5960,7 @@ class _AuthScanTestBase(TestCase):
         instance = MockSession.return_value
         instance.get.side_effect = app.get
         instance.post.side_effect = app.post
-        return AuthScanner().scan(_ORIGIN)
+        return AuthScanner(authorization=_lab_auth(_ORIGIN)).scan(_ORIGIN)
 
     @staticmethod
     def _default_cred_findings(result):
@@ -6184,7 +6195,13 @@ class DefaultCredentialBaselineTest(_AuthScanTestBase):
                 return 302, '', {'Location': '/dashboard'}
             return 200, _failed_page(token=f'csrf-next-{token}')
         app = _LoginApp(on_post, pages={'/dashboard': (200, _DASHBOARD)}, login_page=login_page)
-        result = self._scan(MockSession, app)
+        # P0-4.1: rate-limit yoklaması tek kullanımlık token'ı ana oturumda yeniden kullanır;
+        # 2. denemedeki 403 artık TÜM aktif gönderimleri durdurur. Bu test varsayılan kimlik
+        # bilgisi aşamasının oturum yalıtımını ölçtüğü için yalnızca o aşama yetkilendirilir.
+        instance = MockSession.return_value
+        instance.get.side_effect = app.get
+        instance.post.side_effect = app.post
+        result = AuthScanner(authorization=_lab_auth(_ORIGIN, rate_limit_probe=False)).scan(_ORIGIN)
 
         self.assertIn('Varsayılan kimlik bilgileri geçerli', self._titles(result))
         # ana oturum + baseline + her aday için ayrı oturum (başarıda durur: admin/admin ilk aday)
@@ -6238,10 +6255,14 @@ class RateLimitClassificationTest(_AuthScanTestBase):
         self.assertFalse([t for t in titles if t.startswith('Rate-limit koruması aktif')])
 
     def test_m_network_failure_is_separate_from_http_error(self, MockSession):
-        result = self._scan(MockSession, _LoginApp(lambda u, p, d: requests.Timeout('slow')))
+        app = _LoginApp(lambda u, p, d: requests.Timeout('slow'))
+        result = self._scan(MockSession, app)
         finding = next(f for f in result.findings if f.title == 'Rate-limit testi sonuçsuz')
-        self.assertIn('yanıt yok: 5', finding.evidence)
+        # P0-4.1: yanıt alınamaması durdurma koşuludur — önceden 5 deneme sürüyordu ('yanıt yok: 5')
+        self.assertIn('yanıt yok: 1', finding.evidence)
         self.assertIn('sunucu hatası: 0', finding.evidence)
+        self.assertIn('Sonuç: INCOMPLETE', finding.evidence)
+        self.assertEqual(len(app.posts), 1)
 
 
 class AuthSafeSessionEndToEndTest(_SafeHttpTestBase):
@@ -6263,8 +6284,805 @@ class AuthSafeSessionEndToEndTest(_SafeHttpTestBase):
             'https://public.example/login': do_login,
             'https://public.example/dashboard': (200, {'Content-Type': 'text/html'}, _DASHBOARD),
         })
-        result = AuthScanner().scan('https://public.example/')
+        result = AuthScanner(authorization=_lab_auth('https://public.example')).scan('https://public.example/')
 
         self.assertIn('Varsayılan kimlik bilgileri geçerli', [f.title for f in result.findings])
         self.assertEqual(transport.hosts(), {'public.example'})
         self.assertTrue(any(url.endswith('/dashboard') for _m, url in transport.requested))
+
+
+# ---------------------------------------------------------------------------
+# P0-4.1: Kimlik doğrulama güvenliği ve kanıt incelemesi
+# - CONFIRMED yalnızca güvenilir kimliği doğrulanmış durum kanıtıyla
+# - aktif gönderimler varsayılan KAPALI; yalnızca kodla verilen, origin'e bağlı lab yetkisi
+# - paylaşılan durdurma koşulları; yürütülmeyen test asla SECURE değil
+# Tüm yanıtlar gerçek requests.Response; ağ/DNS yok; tüm değerler SAHTEDİR.
+# ---------------------------------------------------------------------------
+
+import inspect
+import pathlib
+from types import SimpleNamespace
+
+from django.test import override_settings
+
+from .services.auth_safety import ActiveAuthAssessment, ActiveAuthTest, AuthOutcome, SubmissionRefused
+from .services.auth_validation import (
+    NEG_CROSS_ORIGIN, NEG_NON_AUTH_LOCATION, SIGNAL_AUTH_MARKER,
+)
+
+_LOGOUT_NAV = '<nav><a href="/logout">Log out</a></nav>'
+_HOME_NO_LOGOUT = ('<html><head><title>Example Portal — Home</title></head><body>'
+                   '<h1>Welcome</h1><p>Your dashboard</p>' + '<div>News item</div>' * 10 + '</body></html>')
+# Formsuz, çıkış bağlantısı OLAN ama kimliği doğrulanmış durum olmayan ara ekranlar
+_INTERSTITIAL_PAGES = {
+    'error': 'Something went wrong. An unexpected error has occurred.',
+    'maintenance': 'We are down for maintenance and will be right back.',
+    'consent': 'Please review and accept the updated terms to continue.',
+    'password_change': 'Your password has expired. Choose a new password to continue.',
+    'challenge': 'Enter the verification code we sent to your phone.',
+}
+_PASSIVE_SECURE_TITLES = {'Login HTTPS üzerinde', 'CAPTCHA koruması mevcut'}
+
+
+def _page(body: str, title: str = 'Example Portal') -> str:
+    return f'<html><head><title>{title}</title></head><body>{body}</body></html>'
+
+
+def _redirected(final_url: str, text: str, status: int = 200, hops=('/login',)) -> requests.Response:
+    """SafeSession'ın ürettiği gibi history'li nihai yanıt."""
+    response = _http_response(status, text, url=final_url)
+    response.history = [_http_response(302, '', url=_ORIGIN + hop) for hop in hops]
+    return response
+
+
+class AuthEvidenceStrengthTest(TestCase):
+    """1: yönlendirme + formun kaybolması CONFIRMED için yetmez; ara ekranlar başarı değildir."""
+
+    def _cmp(self, candidate, baseline=None):
+        baseline = baseline or _http_response(200, _failed_page(), url=_ACTION)
+        return compare_login(baseline, candidate, action_url=_ACTION,
+                             baseline_username='__lilith_invalid_abc', candidate_username='admin')
+
+    def test_redirect_and_missing_form_cannot_confirm_login(self):
+        """Önceden: 2 güçlü sinyal (+ 'welcome/dashboard') → CRITICAL/CONFIRMED."""
+        evidence = self._cmp(_http_response(200, _HOME_NO_LOGOUT, url=_ORIGIN + '/home'))
+        self.assertEqual(set(evidence.strong_signals), {SIGNAL_DISTINCT_LOCATION, SIGNAL_FORM_DISAPPEARED})
+        self.assertIn(SIGNAL_AUTH_MARKER, evidence.supporting_signals)
+        self.assertFalse(evidence.authenticated_state)
+        self.assertFalse(evidence.confirmed)
+        self.assertTrue(evidence.potential)
+
+    def test_interstitial_pages_with_logout_never_confirm_or_suggest_success(self):
+        for name, text in _INTERSTITIAL_PAGES.items():
+            with self.subTest(page=name):
+                evidence = self._cmp(_http_response(200, _page(_LOGOUT_NAV + f'<p>{text}</p>'), url=_ORIGIN + '/app'))
+                self.assertTrue(evidence.negative_signals)
+                self.assertFalse(evidence.authenticated_state)
+                self.assertFalse(evidence.confirmed)
+                self.assertFalse(evidence.potential)
+
+    def test_redirect_to_interstitial_location_is_negative(self):
+        for path in ('/consent', '/maintenance', '/oops', '/terms/accept', '/password/expired'):
+            with self.subTest(path=path):
+                evidence = self._cmp(_http_response(200, _DASHBOARD, url=_ORIGIN + path))
+                self.assertIn(NEG_NON_AUTH_LOCATION, evidence.negative_signals)
+                self.assertFalse(evidence.confirmed)
+
+    def test_unexpected_cross_origin_redirect_is_not_authentication(self):
+        for url in ('https://sso.other.example/home', 'http://example.com/dashboard',
+                    'https://example.com:8443/dashboard'):
+            with self.subTest(url=url):
+                evidence = self._cmp(_http_response(200, _DASHBOARD, url=url))
+                self.assertIn(NEG_CROSS_ORIGIN, evidence.negative_signals)
+                self.assertNotIn(SIGNAL_DISTINCT_LOCATION, evidence.strong_signals)
+                self.assertFalse(evidence.confirmed)
+                self.assertFalse(evidence.potential)
+
+    def test_common_dashboard_chrome_does_not_block_credible_confirmation(self):
+        """Negatif işaretler dar: footer, çerez bildirimi, 2FA ayar bağlantısı, script içeriği eşleşmez."""
+        dashboard = _DASHBOARD.replace('</body>', (
+            '<footer><a href="/terms">Terms of Service</a> · Privacy</footer>'
+            '<div class="cookies">We use cookies. Accept all</div>'
+            '<a href="/settings/security">Enable two-factor authentication</a>'
+            '<script>if (err) { showError("Something went wrong"); }</script></body>'))
+        evidence = self._cmp(_http_response(200, dashboard, url=_ORIGIN + '/dashboard'))
+        self.assertEqual(evidence.negative_signals, [])
+        self.assertTrue(evidence.authenticated_state)
+        self.assertTrue(evidence.confirmed)
+
+    def test_interstitial_text_already_on_failed_login_is_not_negative(self):
+        banner = '<p>Scheduled maintenance window: Sunday 02:00 UTC.</p>'
+        baseline = _http_response(200, _failed_page(banner=banner), url=_ACTION)
+        candidate = _http_response(200, _DASHBOARD.replace('<h1>', banner + '<h1>'), url=_ORIGIN + '/dashboard')
+        evidence = self._cmp(candidate, baseline)
+        self.assertEqual(evidence.negative_signals, [])
+        self.assertTrue(evidence.confirmed)
+
+    def test_redirect_to_lockout_or_challenge_page_is_a_stop_condition(self):
+        ref = (_login_page(),)
+        cases = [
+            ('/account/locked', AttemptKind.RATE_LIMITED),
+            ('/lockout', AttemptKind.RATE_LIMITED),
+            ('/challenge', AttemptKind.BLOCKED),
+            ('/captcha/verify', AttemptKind.BLOCKED),
+            ('/dashboard', AttemptKind.NORMAL),
+        ]
+        for path, expected in cases:
+            with self.subTest(path=path):
+                response = _redirected(_ORIGIN + path, '<html>Please continue.</html>')
+                self.assertEqual(classify_attempt(response, ref).kind, expected)
+        # Yönlendirme yoksa yalnızca yol adı karar vermez (login sayfası /lockout-policy altında olabilir)
+        self.assertEqual(classify_attempt(_http_response(200, _failed_page(), url=_ORIGIN + '/lockout'), ref).kind,
+                         AttemptKind.NORMAL)
+
+
+@patch('Tarama.scanners.auth.requests.Session')
+class AuthEvidenceScannerTest(_AuthScanTestBase):
+    """Yetkili lab fixture'ı ile uçtan uca sınıflandırma (gerçek Response, SafeSession yönlendirmesi)."""
+
+    def test_redirect_and_missing_form_yields_potential_not_confirmed(self, MockSession):
+        def on_post(user, password, data):
+            if (user, password) == ('admin', 'admin'):
+                return 302, '', {'Location': '/home'}
+            return 200, _failed_page()
+        result = self._scan(MockSession, _LoginApp(on_post, pages={'/home': (200, _HOME_NO_LOGOUT)}))
+        found = self._default_cred_findings(result)
+        self.assertEqual(len(found), 1)
+        self.assertEqual((found[0].severity, found[0].status, found[0].confidence),
+                         (Severity.HIGH, FindingStatus.POTENTIAL, Confidence.MEDIUM))
+        self.assertIn('Sonuç: AUTHENTICATION_NOT_ESTABLISHED', found[0].evidence)
+        self.assertNotIn('Varsayılan kimlik bilgileri geçerli', self._titles(result))
+
+    def test_error_maintenance_consent_pages_cannot_confirm_login(self, MockSession):
+        for name in ('error', 'maintenance', 'consent', 'password_change'):
+            with self.subTest(page=name):
+                page = _page(_LOGOUT_NAV + f'<p>{_INTERSTITIAL_PAGES[name]}</p>')
+
+                def on_post(user, password, data):
+                    if (user, password) == ('admin', 'admin'):
+                        return 302, '', {'Location': '/app'}
+                    return 200, _failed_page()
+                result = self._scan(MockSession, _LoginApp(on_post, pages={'/app': (200, page)}))
+                found = self._default_cred_findings(result)
+                self.assertEqual([f.status for f in found], [FindingStatus.MANUAL_REVIEW])
+                self.assertEqual(found[0].severity, Severity.MEDIUM)
+                self.assertIn('Kimliği doğrulanmamış durum işaretleri', found[0].evidence)
+
+    def test_confirmed_requires_and_states_authenticated_state(self, MockSession):
+        def on_post(user, password, data):
+            if (user, password) == ('admin', 'admin'):
+                return 302, '', {'Location': '/dashboard'}
+            return 200, _failed_page()
+        app = _LoginApp(on_post, pages={'/dashboard': (200, _DASHBOARD)})
+        result = self._scan(MockSession, app)
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgileri geçerli')
+        self.assertEqual(finding.status, FindingStatus.CONFIRMED)
+        self.assertIn('Sonuç: AUTHENTICATED_STATE_ESTABLISHED', finding.evidence)
+        self.assertIn('çıkış (logout/sign out) kontrolü göründü', finding.evidence)
+        self.assertEqual(app.default_cred_posts(), [('admin', 'admin')])   # başarıdan sonra gönderim yok
+
+
+@patch('Tarama.scanners.auth.requests.Session')
+class ActiveAuthDefaultOffTest(_AuthScanTestBase):
+    """2: varsayılan yürütme SIFIR kimlik bilgisi gönderimi yapar; yetki yalnızca kodla, origin'e bağlı."""
+
+    def _run(self, MockSession, app, authorization=None, target=_ORIGIN):
+        instance = MockSession.return_value
+        instance.get.side_effect = app.get
+        instance.post.side_effect = app.post
+        scanner = AuthScanner() if authorization is None else AuthScanner(authorization=authorization)
+        return scanner.scan(target)
+
+    def _assert_not_executed(self, result, title, reason_fragment):
+        finding = next(f for f in result.findings if f.title == title)
+        self.assertEqual((finding.severity, finding.status), (Severity.INFO, FindingStatus.INFORMATIONAL))
+        self.assertIn('Sonuç: NOT_EXECUTED', finding.evidence)
+        self.assertIn(reason_fragment, finding.evidence)
+
+    def test_default_scanner_performs_zero_credential_submissions(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        result = self._run(MockSession, app)   # AuthScanner() — varsayılan yapıcı
+        self.assertEqual(app.posts, [])
+        MockSession.return_value.post.assert_not_called()
+        self.assertFalse([c for c in MockSession.return_value.get.call_args_list if 'params' in c.kwargs])
+        reason = 'varsayılan olarak kapalı'
+        self._assert_not_executed(result, 'Rate-limit testi yürütülmedi', reason)
+        self._assert_not_executed(result, 'Varsayılan kimlik bilgisi testi yapılmadı', reason)
+        titles = self._titles(result)
+        self.assertNotIn('Potential Lack of Authentication Rate Limiting', titles)
+        # Pasif değerlendirme etkin kalır
+        for passive in ('Login sayfası tespit edildi', 'Login HTTPS üzerinde', 'CAPTCHA yok',
+                        'Parola alanında autocomplete kapalı değil: password'):
+            self.assertIn(passive, titles)
+
+    def test_get_method_login_form_is_not_submitted_by_default(self, MockSession):
+        get_form = _login_page().replace('method="post"', 'method="get"')
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()), login_page=lambda: get_form)
+        self._run(MockSession, app)
+        self.assertEqual(app.posts, [])
+        self.assertFalse([c for c in MockSession.return_value.get.call_args_list if 'params' in c.kwargs])
+
+    def test_settings_and_environment_cannot_enable_active_tests(self, MockSession):
+        flags = {'LILITH_ACTIVE_AUTH': '1', 'ACTIVE_AUTH': 'true', 'LAB_MODE': '1', 'ALLOW_DEFAULT_CREDENTIALS': '1'}
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        with override_settings(**{k: True for k in flags}), patch.dict(os.environ, flags):
+            self._run(MockSession, app)
+        self.assertEqual(app.posts, [])
+
+    def test_request_style_flags_are_rejected_as_authorization(self, MockSession):
+        for value in (True, 1, 'lab', 'true', {'origin': _ORIGIN, 'default_credentials': True}):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    AuthScanner(authorization=value)
+
+    def test_authorization_requires_a_plain_http_origin_and_bool_flags(self, MockSession):
+        for origin in ('https://example.com/login', 'https://user:pw@example.com', 'ftp://example.com',
+                       'https://example.com?lab=1', 'https://example.com#x', 'example.com', '', None):
+            with self.subTest(origin=origin):
+                with self.assertRaises(ValueError):
+                    ActiveAuthAuthorization(origin, default_credentials=True)
+        with self.assertRaises(TypeError):
+            ActiveAuthAuthorization(_ORIGIN, default_credentials='yes')
+        self.assertFalse(ActiveAuthAuthorization(_ORIGIN).rate_limit_probe)
+        self.assertFalse(ActiveAuthAuthorization(_ORIGIN).default_credentials)
+
+    def test_authorization_without_test_flags_submits_nothing(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        result = self._run(MockSession, app, ActiveAuthAuthorization(_ORIGIN))
+        self.assertEqual(app.posts, [])
+        self._assert_not_executed(result, 'Rate-limit testi yürütülmedi', 'bu aktif testi kapsamıyor')
+        self._assert_not_executed(result, 'Varsayılan kimlik bilgisi testi yapılmadı', 'bu aktif testi kapsamıyor')
+
+    def test_authorization_for_another_origin_submits_nothing(self, MockSession):
+        for origin in ('https://lab.example', 'http://example.com', 'https://example.com:8443'):
+            with self.subTest(origin=origin):
+                app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+                result = self._run(MockSession, app, _lab_auth(origin))
+                self.assertEqual(app.posts, [])
+                self._assert_not_executed(result, 'Varsayılan kimlik bilgisi testi yapılmadı', "lab origin'i dışında")
+
+    def test_form_action_outside_authorized_origin_is_not_submitted(self, MockSession):
+        external = _login_page().replace('action="/login"', 'action="https://idp.other.example/login"')
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()), login_page=lambda: external)
+        result = self._run(MockSession, app, _lab_auth(_ORIGIN))
+        self.assertEqual(app.posts, [])
+        self._assert_not_executed(result, 'Rate-limit testi yürütülmedi', "lab origin'i dışında")
+        self._assert_not_executed(result, 'Varsayılan kimlik bilgisi testi yapılmadı', "lab origin'i dışında")
+
+    def test_each_active_test_requires_its_own_flag(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        result = self._run(MockSession, app, _lab_auth(_ORIGIN, rate_limit_probe=False))
+        self.assertEqual(len(app.posts), 1 + len(_DEFAULT_CREDS))     # yalnızca baseline + liste
+        self.assertIn('Rate-limit testi yürütülmedi', self._titles(result))
+
+        app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        result = self._run(MockSession, app, _lab_auth(_ORIGIN, default_credentials=False))
+        self.assertEqual(len(app.posts), 5)                              # yalnızca rate-limit yoklaması
+        self.assertEqual(app.default_cred_posts(), [])
+        self.assertIn('Varsayılan kimlik bilgisi testi yapılmadı', self._titles(result))
+
+    def test_submission_choke_point_refuses_without_authorization(self, MockSession):
+        """Savunma derinliği: _submit doğrudan çağrılsa bile yetkisiz istek GÖNDERİLMEZ."""
+        scanner = AuthScanner()
+        session = MagicMock()
+        assessment = ActiveAuthAssessment(None, _ORIGIN, 11)
+        with self.assertRaises(SubmissionRefused):
+            scanner._submit(assessment, ActiveAuthTest.DEFAULT_CREDENTIALS, session, _ACTION, 'post',
+                            {'username': 'admin', 'password': 'admin'})
+        session.post.assert_not_called()
+        session.get.assert_not_called()
+
+
+class ActiveAuthEntryPointTest(TestCase):
+    """2: tüm genel yürütme giriş noktaları sınırı uygular (orchestrator, API, arka plan işi)."""
+
+    _OTHER_SCANNERS = ('HeaderScanner', 'PortScanner', 'SqlInjectionScanner', 'XssScanner', 'SslScanner',
+                       'DnsScanner', 'CmsScanner', 'AccessControlScanner', 'IntegrityScanner',
+                       'ErrorDisclosureScanner', 'CmdInjectionScanner', 'NoSqlInjectionScanner')
+
+    def setUp(self):
+        # AuthScanner GERÇEK; diğer scanner'lar boş sonuç döndürür (ağ yok)
+        for cls_name in self._OTHER_SCANNERS:
+            instance = MagicMock()
+            instance.scan.side_effect = lambda target, _n=cls_name: ScanResult(scanner=_n, target=target)
+            patcher = patch(f'Tarama.services.orchestrator.{cls_name}', return_value=instance)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.app = _LoginApp(lambda u, p, d: (200, _failed_page()))
+        session_patcher = patch('Tarama.scanners.auth.requests.Session')
+        instance = session_patcher.start().return_value
+        self.addCleanup(session_patcher.stop)
+        instance.get.side_effect = self.app.get
+        instance.post.side_effect = self.app.post
+
+    def test_run_full_scan_performs_zero_credential_submissions(self):
+        from .services.orchestrator import run_full_scan
+        report = run_full_scan(_ORIGIN)
+        self.assertEqual(self.app.posts, [])
+        not_executed = [f for f in report.auth.findings if 'Sonuç: NOT_EXECUTED' in (f.evidence or '')]
+        self.assertEqual({f.title for f in not_executed},
+                         {'Rate-limit testi yürütülmedi', 'Varsayılan kimlik bilgisi testi yapılmadı'})
+
+    def test_execution_entry_points_expose_no_authorization_parameter(self):
+        from .services.orchestrator import run_full_scan
+        from .services.scan_runner import start_scan, _run_in_background
+        self.assertEqual(list(inspect.signature(run_full_scan).parameters), ['target'])
+        self.assertEqual(list(inspect.signature(start_scan).parameters), ['target'])
+        self.assertEqual(list(inspect.signature(_run_in_background).parameters), ['job_id', 'target'])
+
+    def test_api_request_fields_cannot_enable_active_tests(self):
+        """POST /api/scan/ → start_scan → arka plan işi → run_full_scan → AuthScanner (eşzamanlı)."""
+        class _SyncThread:
+            def __init__(self, target, args=(), **kwargs):
+                self._target, self._args = target, args
+
+            def start(self):
+                self._target(*self._args)
+
+        with _public_dns(), patch('Tarama.services.scan_runner.threading', SimpleNamespace(Thread=_SyncThread)):
+            res = Client().post('/api/scan/', {
+                'url_param': _ORIGIN, 'active_auth': '1', 'authorization': 'lab', 'lab': 'true',
+                'rate_limit_probe': 'true', 'default_credentials': 'true', 'origin': _ORIGIN,
+            })
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(self.app.posts, [])
+        job = ScanJob.objects.get(id=res.json()['job_id'])
+        self.assertEqual(job.status, 'DONE')
+        auth = {f.title: f for f in ScanFinding.objects.filter(job=job, scanner='auth')}
+        for title in ('Rate-limit testi yürütülmedi', 'Varsayılan kimlik bilgisi testi yapılmadı'):
+            self.assertEqual(auth[title].status, 'INFORMATIONAL')
+            self.assertIn('Sonuç: NOT_EXECUTED', auth[title].evidence)
+        self.assertFalse([f for f in auth.values() if f.status == 'SECURE' and f.title not in _PASSIVE_SECURE_TITLES])
+
+    def test_production_code_never_grants_active_authorization(self):
+        """Yetki yalnızca test/lab harness kodunda oluşturulur; üretim kodu AuthScanner'ı yetkisiz kurar."""
+        package = pathlib.Path(__file__).resolve().parent
+        constructions = {}
+        for path in package.rglob('*.py'):
+            if path.name == 'tests.py' or 'migrations' in path.parts:
+                continue
+            source = path.read_text(encoding='utf-8')
+            self.assertNotRegex(source, r'ActiveAuthAuthorization\(', msg=str(path))
+            calls = [c for c in _re.findall(r'AuthScanner\([^)]*\)', source) if not c.startswith('AuthScanner(Scanner')]
+            if calls:
+                constructions[path.name] = calls
+        self.assertEqual(constructions, {'orchestrator.py': ['AuthScanner()']})
+
+
+@patch('Tarama.scanners.auth.requests.Session')
+class ActiveAuthStopConditionTest(_AuthScanTestBase):
+    """3: throttle / challenge / şüpheli kilit / sunucu hatası TÜM sonraki gönderimleri durdurur."""
+
+    @staticmethod
+    def _nth(n_stop, outcome, then=lambda: (200, _failed_page())):
+        counter = itertools.count(1)
+
+        def on_post(user, password, data):
+            return outcome() if next(counter) == n_stop else then()
+        return on_post
+
+    def _assert_stopped_after(self, app, n):
+        self.assertEqual(len(app.posts), n)
+        self.assertEqual([u for u, _p in app.posts], [f'wronguser_{i}_xyz' for i in range(n)])  # kimlik değişmedi
+        self.assertFalse([u for u, _p in app.posts if u.startswith('__lilith_invalid_')])        # baseline yok
+        self.assertEqual(app.default_cred_posts(), [])
+
+    def _default_cred_skip(self, result):
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi yapılmadı')
+        self.assertEqual(finding.status, FindingStatus.INFORMATIONAL)
+        self.assertIn('Sonuç: NOT_EXECUTED', finding.evidence)
+        self.assertIn('durdurma koşulu', finding.evidence)
+
+    def test_throttle_stops_all_later_submissions(self, MockSession):
+        """Önceden: rate-limit aşamasındaki 429'dan sonra baseline yine gönderiliyordu."""
+        app = _LoginApp(self._nth(3, lambda: (429, 'Too Many Requests')))
+        result = self._scan(MockSession, app)
+        self._assert_stopped_after(app, 3)
+        self.assertIn('Sonuç: CONTROL_RESPONSE_OBSERVED',
+                      next(f for f in result.findings if f.title == 'Rate-limit koruması aktif (HTTP status)').evidence)
+        self._default_cred_skip(result)
+
+    def test_challenge_stops_immediately(self, MockSession):
+        """Önceden: 403/challenge sonrası 5 denemenin tamamı gönderiliyordu."""
+        for name, outcome in {'403': lambda: (403, '<html>Forbidden</html>'),
+                              'text': lambda: (200, _failed_page(banner='Verify you are human'))}.items():
+            with self.subTest(challenge=name):
+                app = _LoginApp(self._nth(2, outcome))
+                result = self._scan(MockSession, app)
+                self._assert_stopped_after(app, 2)
+                blocked = next(f for f in result.findings
+                               if f.title == 'Rate-limit testi sonuçsuz: WAF/challenge yanıtı')
+                self.assertIn('Sonuç: BLOCKED', blocked.evidence)
+                self._default_cred_skip(result)
+
+    def test_suspected_lockout_redirect_stops(self, MockSession):
+        app = _LoginApp(self._nth(2, lambda: (302, '', {'Location': '/account/locked'})),
+                        pages={'/account/locked': (200, _page('<p>Please contact support.</p>'))})
+        result = self._scan(MockSession, app)
+        self._assert_stopped_after(app, 2)
+        self.assertIn('Hesap kilidi / rate-limit koruması aktif', self._titles(result))
+        self._default_cred_skip(result)
+
+    def test_unexpected_server_failure_stops(self, MockSession):
+        """Önceden: 5xx sonrası denemeler sürüyor, sonra 'Potential Lack ...' raporlanabiliyordu."""
+        app = _LoginApp(self._nth(3, lambda: (500, 'Internal Server Error')))
+        result = self._scan(MockSession, app)
+        self._assert_stopped_after(app, 3)
+        titles = self._titles(result)
+        self.assertNotIn('Potential Lack of Authentication Rate Limiting', titles)
+        finding = next(f for f in result.findings if f.title == 'Rate-limit testi sonuçsuz')
+        self.assertIn('Sonuç: INCOMPLETE', finding.evidence)
+        self._default_cred_skip(result)
+
+    def test_stop_during_default_credentials_prevents_remaining_candidates(self, MockSession):
+        """Önceden: aday sırasında 5xx / ağ hatası 'continue' ile sonraki adaylara geçiyordu."""
+        cases = {
+            'server_error': (('admin', 'admin'), lambda: (500, 'boom'), 'Sonuç: INCOMPLETE'),
+            'network': (('admin', 'password'), lambda: requests.ConnectionError('down'), 'Sonuç: INCOMPLETE'),
+            'challenge': (('admin', 'admin'), lambda: (200, _failed_page(banner='Attention Required!')),
+                          'Sonuç: BLOCKED'),
+            'lockout': (('admin', 'admin'), lambda: (200, _failed_page(banner='Account locked.')),
+                        'Sonuç: CONTROL_RESPONSE_OBSERVED'),
+        }
+        for name, (stop_at, outcome, expected) in cases.items():
+            with self.subTest(stop=name):
+                def on_post(user, password, data, _stop=stop_at, _outcome=outcome):
+                    return _outcome() if (user, password) == _stop else (200, _failed_page())
+                app = _LoginApp(on_post)
+                result = self._scan(MockSession, app)
+                expected_posts = list(_DEFAULT_CREDS[:_DEFAULT_CREDS.index(stop_at) + 1])
+                self.assertEqual(app.default_cred_posts(), expected_posts)
+                finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi tamamlanamadı')
+                self.assertEqual(finding.status, FindingStatus.INFORMATIONAL)
+                self.assertIn(expected, finding.evidence)
+                self.assertIn(f'Denenen: {len(expected_posts)}/{len(_DEFAULT_CREDS)}', finding.evidence)
+
+    def test_baseline_failure_stops_before_any_candidate(self, MockSession):
+        app = _LoginApp(lambda u, p, d: (500, 'boom') if u.startswith('__lilith_invalid_') else (200, _failed_page()))
+        instance = MockSession.return_value
+        instance.get.side_effect = app.get
+        instance.post.side_effect = app.post
+        result = AuthScanner(authorization=_lab_auth(_ORIGIN, rate_limit_probe=False)).scan(_ORIGIN)
+        self.assertEqual(len(app.posts), 1)
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi yapılmadı')
+        self.assertIn('Sonuç: INCOMPLETE', finding.evidence)
+
+    def test_assessment_budget_is_a_hard_cap(self, MockSession):
+        assessment = ActiveAuthAssessment(_lab_auth(_ORIGIN), _ORIGIN, max_submissions=2)
+        assessment.claim(ActiveAuthTest.RATE_LIMIT_PROBE, _ACTION)
+        assessment.claim(ActiveAuthTest.RATE_LIMIT_PROBE, _ACTION)
+        with self.assertRaises(SubmissionRefused):
+            assessment.claim(ActiveAuthTest.DEFAULT_CREDENTIALS, _ACTION)
+
+
+@patch('Tarama.scanners.auth.requests.Session')
+class UntestedNeverSecureTest(_AuthScanTestBase):
+    """3/4: yürütülmeyen ve tamamlanamayan testler asla SECURE değildir; sonuçlar ayırt edilir."""
+
+    _SCENARIOS = {
+        'default_off': (None, lambda u, p, d: (200, _failed_page())),
+        'other_origin': (ActiveAuthAuthorization('https://lab.example', rate_limit_probe=True,
+                                                 default_credentials=True), lambda u, p, d: (200, _failed_page())),
+        'no_flags': (ActiveAuthAuthorization(_ORIGIN), lambda u, p, d: (200, _failed_page())),
+        'blocked': (_lab_auth(_ORIGIN), lambda u, p, d: (403, 'Forbidden')),
+        'server_error': (_lab_auth(_ORIGIN), lambda u, p, d: (500, 'boom')),
+        'network': (_lab_auth(_ORIGIN), lambda u, p, d: requests.Timeout('slow')),
+        'baseline_error': (_lab_auth(_ORIGIN, rate_limit_probe=False), lambda u, p, d: (502, 'Bad Gateway')),
+    }
+
+    def _run(self, MockSession, authorization, on_post):
+        app = _LoginApp(on_post)
+        instance = MockSession.return_value
+        instance.get.side_effect = app.get
+        instance.post.side_effect = app.post
+        return AuthScanner(authorization=authorization).scan(_ORIGIN)
+
+    def test_untested_or_incomplete_scenarios_never_produce_secure(self, MockSession):
+        for name, (authorization, on_post) in self._SCENARIOS.items():
+            with self.subTest(scenario=name):
+                result = self._run(MockSession, authorization, on_post)
+                secure = {f.title for f in result.findings if f.status == FindingStatus.SECURE}
+                self.assertLessEqual(secure, _PASSIVE_SECURE_TITLES)
+                inconclusive = [f for f in result.findings if any(
+                    f'Sonuç: {o.value}' in (f.evidence or '')
+                    for o in (AuthOutcome.NOT_EXECUTED, AuthOutcome.INCOMPLETE, AuthOutcome.BLOCKED))]
+                self.assertTrue(inconclusive)
+                for finding in inconclusive:
+                    self.assertEqual(finding.status, FindingStatus.INFORMATIONAL)
+                    self.assertEqual(finding.severity, Severity.INFO)
+
+    def test_outcome_vocabulary_distinguishes_assessment_states(self, MockSession):
+        def valid_admin(user, password, data):
+            if (user, password) == ('admin', 'admin'):
+                return 302, '', {'Location': '/dashboard'}
+            return 200, _failed_page()
+
+        cases = [
+            ('authenticated', valid_admin, 'Varsayılan kimlik bilgileri geçerli', AuthOutcome.AUTHENTICATED_STATE_ESTABLISHED),
+            ('not_authenticated', lambda u, p, d: (200, _failed_page()), 'Varsayılan kimlik bilgileri geçersiz',
+             AuthOutcome.AUTHENTICATION_NOT_ESTABLISHED),
+            ('control', lambda u, p, d: (429, 'Too Many Requests'), 'Rate-limit koruması aktif (HTTP status)',
+             AuthOutcome.CONTROL_RESPONSE_OBSERVED),
+            ('blocked', lambda u, p, d: (403, 'Forbidden'), 'Rate-limit testi sonuçsuz: WAF/challenge yanıtı',
+             AuthOutcome.BLOCKED),
+            ('incomplete', lambda u, p, d: (500, 'boom'), 'Rate-limit testi sonuçsuz', AuthOutcome.INCOMPLETE),
+        ]
+        for name, on_post, title, outcome in cases:
+            with self.subTest(state=name):
+                app = _LoginApp(on_post, pages={'/dashboard': (200, _DASHBOARD)})
+                result = self._scan(MockSession, app)
+                finding = next(f for f in result.findings if f.title == title)
+                self.assertTrue(finding.evidence.startswith(f'Sonuç: {outcome.value}'), finding.evidence)
+
+        result = self._run(MockSession, None, lambda u, p, d: (200, _failed_page()))
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi yapılmadı')
+        self.assertTrue(finding.evidence.startswith('Sonuç: NOT_EXECUTED'))
+
+    def test_outcome_evidence_never_contains_credentials_or_session_values(self, MockSession):
+        def on_post(user, password, data):
+            if (user, password) == ('admin', 'admin'):
+                return 302, '', {'Location': '/home', 'Set-Cookie': 'sessionid=FakeSessionValue123; HttpOnly'}
+            return 200, _failed_page()
+        app = _LoginApp(on_post, pages={'/home': (200, _HOME_NO_LOGOUT)})
+        result = self._scan(MockSession, app)
+        for finding in result.findings:
+            evidence = finding.evidence or ''
+            self.assertNotIn('FakeSessionValue123', evidence)
+            self.assertNotIn('__lilith_invalid_', evidence)
+            self.assertNotIn('wrongpass_', evidence)
+            for _u, password in _DEFAULT_CREDS:
+                self.assertNotIn(f'Parola: {password}', evidence)
+
+
+# ---------------------------------------------------------------------------
+# P0-4.1 son düzeltmeler:
+# (1) kimlik doğrulama gönderiminin yönlendirmeleri yetkili origin'e bağlı (takipten ÖNCE)
+# (2) enjeksiyon scanner'ları kimlik bilgisi işleyen formlara / uçlara payload göndermez
+# Gerçek SafeSession + mock'lu transport/DNS; ağ tripwire'ı etkin; tüm değerler SAHTEDİR.
+# ---------------------------------------------------------------------------
+
+from bs4 import BeautifulSoup
+
+from .scanners.credential_guard import (
+    NOT_ASSESSED_ENDPOINT_TITLE, NOT_ASSESSED_FORM_TITLE, credential_endpoint_reason,
+    credential_form_reason, not_assessed_finding,
+)
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_LAB = 'https://public.example'
+_LAB_LOGIN_PAGE = ('<html><head><title>Portal</title></head><body><form action="/login" method="post">'
+                   '<input type="text" name="username"><input type="password" name="password">'
+                   '</form></body></html>')
+_LAB_FAILED_PAGE = _LAB_LOGIN_PAGE.replace('<form', '<p>Invalid credentials</p><form')
+_HTML = {'Content-Type': 'text/html'}
+
+
+class _GuardStop(Exception):
+    pass
+
+
+class SafeSessionRedirectGuardTest(_SafeHttpTestBase):
+    """redirect_guard takipten ÖNCE çalışır; guard'sız davranış ve SSRF koruması değişmez."""
+
+    def setUp(self):
+        super().setUp()
+        self._dns({'public.example': [_PUBLIC_IP], 'other.example': [_PUBLIC_IP_2]})
+
+    def test_guard_blocks_every_redirect_status_before_any_request_to_destination(self):
+        for status in _REDIRECT_STATUSES:
+            with self.subTest(status=status):
+                transport = self._transport({
+                    _LAB + '/login': (status, {'Location': 'https://other.example/collect'}, ''),
+                    'https://other.example/collect': (200, {}, 'stolen'),
+                })
+                calls = []
+
+                def guard(code, current_url, next_url):
+                    calls.append((code, current_url, next_url))
+                    raise _GuardStop()
+                with self.assertRaises(_GuardStop):
+                    safe_session().post(_LAB + '/login', data={'password': 'FakePassword1'}, redirect_guard=guard)
+                self.assertEqual(calls, [(status, _LAB + '/login', 'https://other.example/collect')])
+                self.assertEqual(transport.requested, [('POST', _LAB + '/login')])
+
+    def test_without_guard_redirect_behavior_is_unchanged(self):
+        """Diğer scanner'lar: 307 yöntem+gövdeyi korur ve (SSRF'ye uygun) hedefe takip edilir."""
+        transport = self._transport({
+            _LAB + '/form': (307, {'Location': 'https://other.example/next'}, ''),
+            'https://other.example/next': (200, {}, 'ok'),
+        })
+        res = safe_session().post(_LAB + '/form', data={'q': 'x'})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(transport.requested, [('POST', _LAB + '/form'), ('POST', 'https://other.example/next')])
+
+    def test_permissive_guard_never_bypasses_ssrf_policy(self):
+        transport = self._transport({_LAB + '/login': (307, {'Location': 'http://127.0.0.1/admin'}, '')})
+        with self.assertRaises(OutboundRequestBlocked):
+            safe_session().post(_LAB + '/login', data={'u': 'x'}, redirect_guard=lambda *a: None)
+        self.assertNotIn('127.0.0.1', transport.hosts())
+
+
+class AuthRedirectOriginBoundaryTest(_SafeHttpTestBase):
+    """Kimlik bilgisi / gövde / oturum durumu yetkili origin dışına yönlendirmeyle taşınamaz."""
+
+    _OUTSIDE = ('https://other.example/collect', 'http://public.example/collect',
+                'https://public.example:8443/collect')
+
+    def setUp(self):
+        super().setUp()
+        self._dns({'public.example': [_PUBLIC_IP], 'other.example': [_PUBLIC_IP_2]})
+
+    def _scan(self, routes, **auth_flags):
+        transport = self._transport({_LAB + '/': (200, _HTML, _LAB_LOGIN_PAGE), **routes})
+        result = AuthScanner(authorization=_lab_auth(_LAB, **auth_flags)).scan(_LAB + '/')
+        return transport, result
+
+    @staticmethod
+    def _posts(transport, url=_LAB + '/login'):
+        return [u for m, u in transport.requested if m == 'POST' and u == url]
+
+    def test_cross_origin_redirect_never_forwards_credentials(self):
+        for status in _REDIRECT_STATUSES:
+            for destination in self._OUTSIDE:
+                with self.subTest(status=status, destination=destination):
+                    transport, result = self._scan({
+                        _LAB + '/login': (status, {'Location': destination}, ''),
+                        destination: (200, _HTML, '<a href="/logout">Log out</a>'),
+                    })
+                    self.assertNotIn(destination, [u for _m, u in transport.requested])
+                    self.assertEqual(len(self._posts(transport)), 1)   # durdu; yeniden deneme yok
+                    stopped = next(f for f in result.findings
+                                   if f.title == 'Rate-limit testi durduruldu: yetkili origin dışına yönlendirme')
+                    self.assertEqual(stopped.status, FindingStatus.INFORMATIONAL)
+                    self.assertIn('Sonuç: BLOCKED', stopped.evidence)
+                    self.assertIn(f'HTTP {status}', stopped.evidence)
+                    skipped = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi yapılmadı')
+                    self.assertIn('Sonuç: NOT_EXECUTED', skipped.evidence)
+                    secure = {f.title for f in result.findings if f.status == FindingStatus.SECURE}
+                    self.assertLessEqual(secure, _PASSIVE_SECURE_TITLES)
+
+    def test_cross_origin_redirect_during_default_credentials_stops_assessment(self):
+        def login(request):
+            if 'username=admin&password=admin' in (request.body or ''):
+                return (307, {'Location': 'https://other.example/sso'}, '')
+            return (200, _HTML, _LAB_FAILED_PAGE)
+        transport, result = self._scan({_LAB + '/login': login}, rate_limit_probe=False)
+        self.assertNotIn('other.example', transport.hosts())
+        self.assertEqual(len(self._posts(transport)), 2)                # baseline + admin/admin, sonra dur
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi tamamlanamadı')
+        self.assertIn('Sonuç: BLOCKED', finding.evidence)
+        self.assertIn("lab origin'i dışına", finding.evidence)
+        self.assertNotIn('Varsayılan kimlik bilgileri geçerli', [f.title for f in result.findings])
+
+    def test_cross_origin_redirect_on_baseline_prevents_all_candidates(self):
+        transport, result = self._scan({_LAB + '/login': (302, {'Location': 'https://other.example/x'}, '')},
+                                       rate_limit_probe=False)
+        self.assertEqual(len(self._posts(transport)), 1)
+        self.assertNotIn('other.example', transport.hosts())
+        finding = next(f for f in result.findings if f.title == 'Varsayılan kimlik bilgisi testi yapılmadı')
+        self.assertIn('Sonuç: BLOCKED', finding.evidence)
+
+    def test_authorized_same_origin_redirects_remain_functional(self):
+        """307 aynı origin'e: yöntem+gövde korunur, akış normal sürer (rate-limit + varsayılan liste)."""
+        transport, result = self._scan({
+            _LAB + '/login': (307, {'Location': '/session/continue'}, ''),
+            _LAB + '/session/continue': (200, _HTML, _LAB_FAILED_PAGE),
+        })
+        continued = self._posts(transport, _LAB + '/session/continue')
+        self.assertEqual(len(continued), 5 + 1 + len(_DEFAULT_CREDS))
+        titles = [f.title for f in result.findings]
+        self.assertIn('Potential Lack of Authentication Rate Limiting', titles)
+        self.assertIn('Varsayılan kimlik bilgileri geçersiz', titles)
+        self.assertFalse([f for f in result.findings if 'Sonuç: BLOCKED' in (f.evidence or '')])
+
+
+class CredentialFormRecognitionTest(TestCase):
+
+    @staticmethod
+    def _form(html):
+        return BeautifulSoup(html, 'html.parser').find('form')
+
+    def test_credential_handling_forms_are_recognized(self):
+        cases = {
+            'password_type': ('<form action="/x"><input type="password" name="p"></form>', '/x'),
+            'password_name': ('<form action="/x"><input name="user_passwd"></form>', '/x'),
+            'otp_field': ('<form action="/x"><input name="otp_code"></form>', '/x'),
+            'autocomplete': ('<form action="/x"><input name="c" autocomplete="one-time-code"></form>', '/x'),
+            'login_action': ('<form action="/account/login"><input name="email"></form>', '/account/login'),
+            'wp_login': ('<form action="/wp-login.php"><input name="log"></form>', '/wp-login.php'),
+            'reset': ('<form action="/password/reset"><input name="email"></form>', '/password/reset'),
+            'register': ('<form action="/register"><input name="username"></form>', '/register'),
+            'form_id': ('<form id="login_form" action="/x"><input name="email"></form>', '/x'),
+            'submit_label': ('<form action="/x"><input name="email"><button>Sign in</button></form>', '/x'),
+        }
+        for name, (html, action) in cases.items():
+            with self.subTest(form=name):
+                self.assertIsNotNone(credential_form_reason(self._form(html), 'https://example.com' + action))
+
+    def test_ordinary_forms_are_not_recognized(self):
+        cases = {
+            'search': ('<form action="/search"><input name="q"><button>Search</button></form>', '/search'),
+            'comment': ('<form action="/comments" class="comment-form"><input name="author">'
+                        '<textarea name="body"></textarea></form>', '/comments'),
+            'newsletter': ('<form action="/subscribe"><input name="email"></form>', '/subscribe'),
+            'author_page': ('<form action="/blog/author/posts"><input name="q"></form>', '/blog/author/posts'),
+            'compass': ('<form action="/geo"><input name="compass"></form>', '/geo'),
+            'profile': ('<form action="/profile/update"><input name="username"></form>', '/profile/update'),
+        }
+        for name, (html, action) in cases.items():
+            with self.subTest(form=name):
+                self.assertIsNone(credential_form_reason(self._form(html), 'https://example.com' + action))
+
+    def test_endpoint_recognition(self):
+        for url in ('https://e.example/api/login', 'https://e.example/auth', 'https://e.example/api/v1/session',
+                    'https://e.example/oauth/token', 'https://e.example/users/sign_in'):
+            with self.subTest(url=url):
+                self.assertIsNotNone(credential_endpoint_reason(url))
+        for url in ('https://e.example/api/users', 'https://e.example/api/search', 'https://e.example/authors'):
+            with self.subTest(url=url):
+                self.assertIsNone(credential_endpoint_reason(url))
+
+    def test_not_assessed_finding_is_informational_and_redacted(self):
+        finding = not_assessed_finding('https://e.example/login?token=FakeToken123&lang=en', 'parola alanı')
+        self.assertEqual((finding.severity, finding.status), (Severity.INFO, FindingStatus.INFORMATIONAL))
+        self.assertIn('Sonuç: NOT_ASSESSED', finding.evidence)
+        self.assertNotIn('FakeToken123', finding.to_dict()['affected_url'])
+        summary = summarize_findings([finding])
+        self.assertEqual((summary['confirmed'], summary['potential'], summary['manual_review'], summary['secure']),
+                         (0, 0, 0, 0))
+
+
+class InjectionCredentialFormGuardTest(_SafeHttpTestBase):
+    """Varsayılan enjeksiyon taraması login formuna / auth ucuna hiçbir istek göndermez;
+    sıradan formlar test edilmeye devam eder."""
+
+    _PAGE = ('<html><body>'
+             '<form action="/login" method="post"><input name="username">'
+             '<input type="password" name="password"><button>Log in</button></form>'
+             '<form action="/search" method="post"><input name="q"></form>'
+             '</body></html>')
+
+    def setUp(self):
+        super().setUp()
+        self._dns({'public.example': [_PUBLIC_IP]})
+
+    def test_default_injection_scans_skip_authentication_forms(self):
+        for scanner_cls in (SqlInjectionScanner, XssScanner, CmdInjectionScanner, NoSqlInjectionScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                transport = self._transport({_LAB + '/': (200, _HTML, self._PAGE)})
+                result = scanner_cls().scan(_LAB + '/')
+                self.assertIsNone(result.error)
+                requested = [u for _m, u in transport.requested]
+                self.assertFalse([u for u in requested if u.startswith(_LAB + '/login')])
+                self.assertTrue([u for u in requested if u.startswith(_LAB + '/search')])   # sıradan form test edildi
+                skipped = [f for f in result.findings if f.title == NOT_ASSESSED_FORM_TITLE]
+                self.assertEqual(len(skipped), 1)
+                self.assertEqual(skipped[0].status, FindingStatus.INFORMATIONAL)
+                self.assertIn('parola alanı', skipped[0].evidence)
+                self.assertFalse([f for f in result.findings if f.status == FindingStatus.SECURE])
+
+    def test_get_method_login_form_receives_no_payload(self):
+        page = '<html><body><form action="/signin" method="get"><input name="email"></form></body></html>'
+        for scanner_cls in (SqlInjectionScanner, XssScanner, CmdInjectionScanner, NoSqlInjectionScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                transport = self._transport({_LAB + '/': (200, _HTML, page)})
+                result = scanner_cls().scan(_LAB + '/')
+                self.assertFalse([u for _m, u in transport.requested if '/signin' in u])
+                self.assertIn(NOT_ASSESSED_FORM_TITLE, [f.title for f in result.findings])
+
+    def test_json_authentication_endpoints_receive_no_payload(self):
+        for scanner_cls in (SqlInjectionScanner, NoSqlInjectionScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                transport = self._transport({_LAB + '/api/login': (200, {'Content-Type': 'application/json'}, '{}')})
+                result = scanner_cls().scan(_LAB + '/api/login')
+                self.assertEqual([m for m, _u in transport.requested], ['GET'])   # yalnızca ilk sayfa
+                finding = next(f for f in result.findings if f.title == NOT_ASSESSED_ENDPOINT_TITLE)
+                self.assertEqual(finding.status, FindingStatus.INFORMATIONAL)
+
+    def test_ordinary_json_api_still_tested(self):
+        for scanner_cls in (SqlInjectionScanner, NoSqlInjectionScanner):
+            with self.subTest(scanner=scanner_cls.__name__):
+                transport = self._transport({_LAB + '/api/users': (200, {'Content-Type': 'application/json'}, '{}')})
+                result = scanner_cls().scan(_LAB + '/api/users')
+                self.assertIn(('POST', _LAB + '/api/users'), transport.requested)
+                self.assertNotIn(NOT_ASSESSED_ENDPOINT_TITLE, [f.title for f in result.findings])

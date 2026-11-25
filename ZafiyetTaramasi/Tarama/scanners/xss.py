@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from .credential_guard import credential_form_reason, not_assessed_finding
 from ..services.evidence_redaction import redact_sensitive_text
 from ..services.safe_http import SafeSession, safe_session
 
@@ -703,6 +704,11 @@ class XssScanner(Scanner):
         for form in forms:
             action_url = urljoin(target, form.get("action") or target)
             method     = form.get("method", "get").lower()
+            # Kimlik bilgisi işleyen formlara (reflected + stored) payload gönderilmez (P0-4.1)
+            reason = credential_form_reason(form, action_url)
+            if reason:
+                result.findings.append(not_assessed_finding(action_url, reason))
+                continue
             for field_name, _ in self._injectable_fields(form):
                 self._test_field(action_url, method, form, field_name, session, result)
                 self._test_stored_field(action_url, method, form, field_name,

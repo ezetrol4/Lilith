@@ -7,6 +7,11 @@ biçimde farklıysa VE kimliği doğrulanmış duruma işaret eden kanıt taşı
 HTTP 200, "Welcome"/"Dashboard" gibi tek bir kelime ya da hata kelimesinin yokluğu
 başarı kanıtı DEĞİLDİR.
 
+P0-4.1: "yönlendirme + giriş formunun kaybolması" da başarı kanıtı DEĞİLDİR — hata,
+bakım, onay, challenge ve parola değiştirme ekranları da formsuzdur. CONFIRMED için
+güvenilir kimliği doğrulanmış durum kanıtı (yeni beliren çıkış kontrolü) + bağımsız bir
+geçiş sinyali gerekir ve kimliği doğrulanmamış durum işareti OLMAMALIDIR.
+
 Yanıt karşılaştırması P0-3'ün `path_baseline.signature` / `compare_signatures`
 fonksiyonlarını yeniden kullanır (durum, yönlendirme hedefi, içerik türü, başlık,
 dinamik değerleri normalize edilmiş gövde benzerliği); path_baseline değiştirilmez.
@@ -53,6 +58,20 @@ _CHALLENGE_TEXT_RE = re.compile(
 )
 
 
+# Yönlendirme sonrası nihai yol: şüpheli hesap kilidi / challenge
+_LOCK_LOCATION_RE = re.compile(r"lock(?:ed|out)?|suspend|too-?many|rate-?limit|throttl", re.IGNORECASE)
+_CHALLENGE_LOCATION_RE = re.compile(r"captcha|challenge|blocked|denied", re.IGNORECASE)
+
+
+def _redirect_final_path(response) -> str:
+    """Yanıt bir yönlendirme zincirinin sonuysa nihai yol, değilse ''."""
+    history = getattr(response, "history", None)
+    url = getattr(response, "url", None)
+    if not isinstance(history, list) or not history or not isinstance(url, str):
+        return ""
+    return urlsplit(url).path or "/"
+
+
 def _text(response) -> str:
     text = getattr(response, "text", "")
     return text if isinstance(text, str) else ""
@@ -93,6 +112,8 @@ def classify_attempt(response, reference_texts: tuple[str, ...] = ()) -> Attempt
     - diğer 5xx → SERVER_ERROR
     - Retry-After / sıfırlanmış X-RateLimit-Remaining başlığı → RATE_LIMITED
     - referansta olmayan hız sınırlama/kilit metni → RATE_LIMITED
+    - yönlendirmeyle varılan kilit sayfası (P0-4.1) → RATE_LIMITED (şüpheli hesap kilidi)
+    - yönlendirmeyle varılan challenge/captcha/blocked sayfası (P0-4.1) → BLOCKED
     - 403 / 419 veya referansta olmayan challenge metni → BLOCKED
     """
     if response is None:
@@ -124,6 +145,13 @@ def classify_attempt(response, reference_texts: tuple[str, ...] = ()) -> Attempt
     if throttle:
         return AttemptClass(AttemptKind.RATE_LIMITED, f"HTTP {status} | yanıtta: '{throttle.group(0)}'")
 
+    # Yönlendirmeyle varılan kilit / challenge sayfası (gövde nötr olsa bile)
+    redirected_to = _redirect_final_path(response)
+    if redirected_to and _LOCK_LOCATION_RE.search(redirected_to):
+        return AttemptClass(AttemptKind.RATE_LIMITED, f"HTTP {status} | kilit sayfasına yönlendirme")
+    if redirected_to and _CHALLENGE_LOCATION_RE.search(redirected_to):
+        return AttemptClass(AttemptKind.BLOCKED, f"HTTP {status} | challenge sayfasına yönlendirme")
+
     if status in (403, 419):
         return AttemptClass(AttemptKind.BLOCKED, f"HTTP {status}")
     challenge = _new_match(_CHALLENGE_TEXT_RE, text, reference_texts)
@@ -147,6 +175,16 @@ SIGNAL_FORM_DISAPPEARED = "giriş formu (parola alanı) kayboldu"
 SIGNAL_LOGOUT_APPEARED = "çıkış (logout/sign out) kontrolü göründü"
 SIGNAL_AUTH_MARKER = "kimliği doğrulanmış alan işareti göründü"
 
+# Kimliği doğrulanmamış durum işaretleri (adayda YENİ). Biri bile varsa yanıt başarılı
+# giriş sayılmaz: en fazla MANUAL_REVIEW (CONFIRMED / POTENTIAL değil).
+NEG_CROSS_ORIGIN = "farklı origin'e beklenmeyen yönlendirme"
+NEG_NON_AUTH_LOCATION = "giriş-dışı ara konuma yönlendirme (hata, kilit, MFA, onay, bakım ...)"
+NEG_GENERIC_ERROR = "genel hata sayfası"
+NEG_MAINTENANCE = "bakım / hizmet dışı sayfası"
+NEG_CONSENT = "onay / koşul kabul ekranı"
+NEG_CHALLENGE = "challenge / ek doğrulama adımı"
+NEG_PASSWORD_CHANGE = "parola değiştirme / süresi dolmuş parola ekranı"
+
 _PASSWORD_INPUT_RE = re.compile(r"<input\b[^>]*\btype\s*=\s*[\"']?password\b", re.IGNORECASE)
 _LOGOUT_RE = re.compile(
     r"(?:href|action)\s*=\s*[\"'][^\"']*(?:log-?out|sign-?out|log-?off)"
@@ -159,9 +197,39 @@ _AUTH_MARKER_RE = re.compile(r"dashboard|my.?account|account.?settings|\bprofile
 # Bu yollara yönlendirme kimliği doğrulanmış durum sayılmaz (giriş, hata, kilit, challenge, MFA...)
 _NON_AUTH_LOCATION_RE = re.compile(
     r"log-?in|sign-?in|auth|error|fail|denied|lock|captcha|challenge|block|limit|verify|"
-    r"mfa|2fa|otp|reset|forgot",
+    r"mfa|2fa|otp|reset|forgot|"
+    r"maintenance|unavailable|oops|consent|terms|agree|interstitial|expired|change-?password",
     re.IGNORECASE,
 )
+# Görünür metinde YENİ beliren ara ekran ifadeleri. Dar tutulur: panodaki "Terms of
+# Service" bağlantısı, çerez bildirimi veya "two-factor" ayar bağlantısı eşleşmez.
+_INTERSTITIAL_TEXT = (
+    (NEG_GENERIC_ERROR, re.compile(
+        r"something went wrong|an? (?:unexpected |internal )?error (?:has )?occurred|unexpected error|"
+        r"internal server error|bad request|page not found|404 not found|\boops\b|"
+        r"traceback \(most recent|unhandled exception|exception (?:was )?thrown", re.IGNORECASE)),
+    (NEG_MAINTENANCE, re.compile(
+        r"under maintenance|down for maintenance|(?:scheduled |planned )?maintenance (?:mode|in progress|window)|"
+        r"temporarily unavailable|service unavailable|be right back|under construction", re.IGNORECASE)),
+    (NEG_CONSENT, re.compile(
+        r"\bconsent to\b|give (?:your )?consent|review and accept|"
+        r"(?:accept|agree to) (?:the |our )?(?:updated |new )?(?:terms|conditions|privacy policy)|"
+        r"authori[sz]e (?:this |the )?(?:app|application)\b|(?:grant|allow) access to your account",
+        re.IGNORECASE)),
+    (NEG_CHALLENGE, re.compile(
+        _CHALLENGE_TEXT_RE.pattern
+        + r"|enter (?:the |your )?(?:verification |security |authentication |one-time )?code"
+          r"|verification code (?:has been |was )?sent|we sent (?:you )?a code|verify (?:it'?s|it is) you"
+          r"|verify your (?:identity|device|account)|complete (?:the )?(?:captcha|challenge)",
+        re.IGNORECASE)),
+    (NEG_PASSWORD_CHANGE, re.compile(
+        r"password (?:has )?expired|must (?:change|reset|update) (?:your )?password|"
+        r"(?:choose|set|create) a new password|(?:change|update) your password (?:to continue|before)",
+        re.IGNORECASE)),
+)
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 @dataclass
@@ -169,20 +237,47 @@ class LoginEvidence:
     comparison: LoginComparison
     strong_signals: list[str] = field(default_factory=list)
     supporting_signals: list[str] = field(default_factory=list)
+    negative_signals: list[str] = field(default_factory=list)
+
+    @property
+    def authenticated_state(self) -> bool:
+        """Güvenilir kimliği doğrulanmış durum kanıtı: başarısız girişte olmayan bir çıkış
+        kontrolü belirdi ve kimliği doğrulanmamış durum işareti yok."""
+        return SIGNAL_LOGOUT_APPEARED in self.strong_signals and not self.negative_signals
 
     @property
     def confirmed(self) -> bool:
-        """CONFIRMED için en az iki güçlü sinyal ya da farklı bir konuma yönlendirme +
-        yeni bir kimliği doğrulanmış alan işareti gerekir."""
-        if self.comparison == LoginComparison.MATCHES_FAILED_LOGIN:
-            return False
-        return len(self.strong_signals) >= 2 or (
-            SIGNAL_DISTINCT_LOCATION in self.strong_signals and bool(self.supporting_signals)
-        )
+        """CONFIRMED (P0-4.1): baseline'dan kesin fark + güvenilir kimliği doğrulanmış durum
+        kanıtı + en az bir bağımsız geçiş sinyali (giriş-dışı konum veya formun kaybolması).
+        Yönlendirme + formun kaybolması (+ genel kelime) tek başına YETMEZ."""
+        return (self.comparison == LoginComparison.DIFFERS_FROM_FAILED_LOGIN
+                and self.authenticated_state
+                and len(self.strong_signals) >= 2)
 
     @property
     def potential(self) -> bool:
-        return self.comparison != LoginComparison.MATCHES_FAILED_LOGIN and bool(self.strong_signals)
+        """Kimliği doğrulanmamış durum işareti varsa en fazla MANUAL_REVIEW."""
+        return (self.comparison != LoginComparison.MATCHES_FAILED_LOGIN
+                and not self.negative_signals and bool(self.strong_signals))
+
+
+def url_origin(url) -> tuple[str, str, int] | None:
+    """(şema, host, etkin port) — yalnızca http/https; ayrıştırılamazsa None."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme, host = (parts.scheme or "").lower(), (parts.hostname or "").lower()
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    return scheme, host, port or _DEFAULT_PORTS[scheme]
+
+
+def _visible_text(html: str) -> str:
+    return _TAG_RE.sub(" ", _SCRIPT_STYLE_RE.sub(" ", html))
 
 
 def invalid_credentials() -> tuple[str, str]:
@@ -234,15 +329,26 @@ def compare_login(baseline, candidate, *, action_url: str,
 
     base_text, cand_text = _text(baseline), _text(candidate)
     base_path, cand_path = _final_path(baseline, action_url), _final_path(candidate, action_url)
+    cand_url = getattr(candidate, "url", None)
 
-    if cand_path != base_path and cand_path != path and not _NON_AUTH_LOCATION_RE.search(cand_path):
-        evidence.strong_signals.append(SIGNAL_DISTINCT_LOCATION)
+    if isinstance(cand_url, str) and url_origin(cand_url) != url_origin(action_url):
+        evidence.negative_signals.append(NEG_CROSS_ORIGIN)
+    elif cand_path != base_path and cand_path != path:
+        if _NON_AUTH_LOCATION_RE.search(cand_path):
+            evidence.negative_signals.append(NEG_NON_AUTH_LOCATION)
+        else:
+            evidence.strong_signals.append(SIGNAL_DISTINCT_LOCATION)
     if has_login_form(baseline) and not has_login_form(candidate):
         evidence.strong_signals.append(SIGNAL_FORM_DISAPPEARED)
     if _LOGOUT_RE.search(cand_text) and not _LOGOUT_RE.search(base_text):
         evidence.strong_signals.append(SIGNAL_LOGOUT_APPEARED)
     if _AUTH_MARKER_RE.search(cand_text) and not _AUTH_MARKER_RE.search(base_text):
         evidence.supporting_signals.append(SIGNAL_AUTH_MARKER)
+
+    cand_visible, base_visible = _visible_text(cand_text), _visible_text(base_text)
+    for label, pattern in _INTERSTITIAL_TEXT:
+        if _new_match(pattern, cand_visible, (base_visible,)):
+            evidence.negative_signals.append(label)
     return evidence
 
 

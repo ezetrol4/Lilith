@@ -1,13 +1,19 @@
 """
 OWASP Top 10 — A07: Identification and Authentication Failures
 
-Kontroller:
+Pasif kontroller (her zaman):
 - Login sayfası tespiti
 - HTTPS üzerinde login zorunluluğu (sayfa + form gönderim hedefi ayrı değerlendirilir)
 - Parola alanı autocomplete
 - CAPTCHA varlığı
+
+Aktif kontroller (P0-4.1: varsayılan olarak KAPALI — yalnızca kodla verilen, origin'e
+bağlı ActiveAuthAuthorization ile kontrollü lab'da; bkz. services/auth_safety.py):
 - Brute-force / rate-limit koruması (5 deneme, bounded)
-- Varsayılan kimlik bilgileri (minimal set, bounded)
+- Varsayılan kimlik bilgileri (minimal set, bounded, başarısız-giriş baseline'ı ile)
+
+Throttle, challenge, şüpheli kilit, sunucu hatası veya yanıt alınamaması değerlendirmedeki
+TÜM sonraki aktif gönderimleri durdurur. Yürütülmeyen / tamamlanamayan test asla SECURE değildir.
 """
 import re
 import requests
@@ -15,8 +21,12 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from .base import Scanner, ScanResult, Finding, Severity, Confidence, FindingStatus
+from ..services.auth_safety import (
+    ActiveAuthAssessment, ActiveAuthAuthorization, ActiveAuthTest, AuthOutcome,
+    OriginBoundaryViolation, outcome_evidence, outcome_for_stop,
+)
 from ..services.auth_validation import (
-    AttemptKind, LoginComparison, classify_attempt, compare_login, describe_response,
+    AttemptClass, AttemptKind, LoginComparison, classify_attempt, compare_login, describe_response,
     invalid_credentials,
 )
 from ..services.safe_http import SafeSession, safe_session
@@ -46,6 +56,10 @@ _DEFAULT_CREDS = [
     ("administrator", "administrator"),
 ]
 
+_RATE_LIMIT_ATTEMPTS = 5
+# Değerlendirme başına mutlak üst sınır: rate-limit + baseline + önceden tanımlı liste
+_MAX_ACTIVE_SUBMISSIONS = _RATE_LIMIT_ATTEMPTS + 1 + len(_DEFAULT_CREDS)
+
 _CAPTCHA_RE = re.compile(
     r"(recaptcha|hcaptcha|captcha|g-recaptcha|cf-turnstile|turnstile)",
     re.I,
@@ -56,14 +70,26 @@ _CSRF_NAMES = frozenset({
     "__requestverificationtoken",
 })
 
+_NOT_EXECUTED_DESCRIPTION = (
+    "This active authentication test was not performed, so it provides no evidence either way. "
+    "Active credential submissions are disabled by default and run only under an explicit, "
+    "in-code authorization for a controlled lab target; they also stop after any throttle, "
+    "challenge, suspected lockout or server failure. This is not a SECURE result."
+)
+
 
 def _is_csrf(name: str) -> bool:
     return any(c in name.lower() for c in _CSRF_NAMES)
 
 
 class AuthScanner(Scanner):
-    def __init__(self, timeout: float = 10.0):
+    def __init__(self, timeout: float = 10.0, *, authorization: ActiveAuthAuthorization | None = None):
+        # Yetki yalnızca kodla verilen ActiveAuthAuthorization olabilir: bool/str/dict gibi
+        # istekten türetilmiş "bayraklar" aktif testleri açamaz.
+        if authorization is not None and not isinstance(authorization, ActiveAuthAuthorization):
+            raise TypeError("authorization yalnızca ActiveAuthAuthorization olabilir")
         self.timeout = timeout
+        self.authorization = authorization
 
     def _make_session(self) -> SafeSession:
         s = safe_session()
@@ -76,19 +102,13 @@ class AuthScanner(Scanner):
         except requests.RequestException:
             return None
 
-    def _post(self, session: requests.Session, url: str,
-              data: dict) -> requests.Response | None:
-        try:
-            return session.post(url, data=data,
-                                timeout=self.timeout, allow_redirects=True)
-        except requests.RequestException:
-            return None
-
     # --- Ana tarama ---
 
     def scan(self, target: str) -> ScanResult:
         result  = ScanResult(scanner="auth", target=target)
         session = self._make_session()
+        # Tek değerlendirmeye ait aktif gönderim durumu (paylaşılmaz, kalıcı değil)
+        assessment = ActiveAuthAssessment(self.authorization, target, _MAX_ACTIVE_SUBMISSIONS)
 
         parsed = urlparse(target)
         base   = f"{parsed.scheme}://{parsed.hostname}"
@@ -141,9 +161,9 @@ class AuthScanner(Scanner):
         method     = form.get("method", "post").lower()
 
         self._check_form_submission_transport(action_url, result)
-        self._check_rate_limit(session, action_url, method, form,
+        self._check_rate_limit(assessment, session, action_url, method, form,
                                user_field, pass_field, captcha_present, login_res.text, result)
-        self._check_default_creds(login_url, action_url, user_field, login_res.text, result)
+        self._check_default_creds(assessment, login_url, action_url, user_field, login_res.text, result)
         return result
 
     # --- Login sayfası bulma ---
@@ -210,15 +230,45 @@ class AuthScanner(Scanner):
                 data[name] = inp.get("value") or ""
         return data
 
-    def _submit(self, session, url, method, data):
+    def _submit(self, assessment: ActiveAuthAssessment, test: ActiveAuthTest,
+                session, url, method, data):
+        """TEK kimlik bilgisi gönderim noktası. Yetki/durdurma/bütçe kontrolü isteğin hemen
+        önünde yapılır (SubmissionRefused → istek gönderilmez). Her yönlendirme adımı takip
+        edilmeden önce yetkili origin'e karşı doğrulanır; dışarı çıkan yönlendirme takip
+        edilmez ve değerlendirme BLOCKED olarak durur (None döner, durdurma kaydedilir)."""
+        assessment.claim(test, url)
+        guard = assessment.redirect_guard()
         try:
             if method == "post":
-                return session.post(url, data=data,
-                                    timeout=self.timeout, allow_redirects=True)
-            return session.get(url, params=data,
-                               timeout=self.timeout, allow_redirects=True)
+                return session.post(url, data=data, timeout=self.timeout,
+                                    allow_redirects=True, redirect_guard=guard)
+            return session.get(url, params=data, timeout=self.timeout,
+                               allow_redirects=True, redirect_guard=guard)
+        except OriginBoundaryViolation as violation:
+            assessment.record_boundary_violation(violation)
+            return None
         except requests.RequestException:
             return None
+
+    @staticmethod
+    def _attempt_class(assessment: ActiveAuthAssessment, response, reference_texts) -> AttemptClass:
+        """Gönderim sonucunu sınıflandırır. Yanıt yoksa ve gönderim değerlendirmeyi durdurduysa
+        (origin dışı yönlendirme) o durdurma nedeni kullanılır — 'yanıt yok' sayılmaz."""
+        if response is None and assessment.stopped:
+            return assessment.stop
+        return classify_attempt(response, reference_texts)
+
+    @staticmethod
+    def _not_executed(title: str, reason: str, url: str, skipped: str) -> Finding:
+        return Finding(
+            severity=Severity.INFO,
+            title=title,
+            evidence=outcome_evidence(AuthOutcome.NOT_EXECUTED, f"{reason} | Gönderilmeyen: {skipped}"),
+            confidence=Confidence.HIGH,
+            status=FindingStatus.INFORMATIONAL,
+            description=_NOT_EXECUTED_DESCRIPTION,
+            affected_url=url,
+        )
 
     # --- Güvenlik kontrolleri ---
 
@@ -249,7 +299,7 @@ class AuthScanner(Scanner):
             ))
 
     def _check_form_submission_transport(self, action_url: str, result: ScanResult) -> None:
-        """Kimlik bilgilerinin GERÇEKTEN gönderildiği hedefin şemasını doğrular."""
+        """Kimlik bilgilerinin GERÇEKTEN gönderileceği hedefin şemasını doğrular (pasif)."""
         if action_url.startswith("http://"):
             result.findings.append(Finding(
                 severity=Severity.HIGH,
@@ -304,28 +354,39 @@ class AuthScanner(Scanner):
         ))
         return False
 
-    def _check_rate_limit(self, session, url, method, form,
+    def _check_rate_limit(self, assessment: ActiveAuthAssessment, session, url, method, form,
                           user_field, pass_field, captcha_present: bool,
                           login_page_text: str, result: ScanResult) -> None:
-        """5 hızlı başarısız deneme ile rate-limit / brute-force koruması testi (bounded, no lockout risk).
+        """En fazla 5 hızlı başarısız deneme ile rate-limit / brute-force koruması testi (AKTİF).
 
         Her yanıt açıkça sınıflandırılır (auth_validation.classify_attempt): yalnızca 429,
-        kanıtlı 503, Retry-After / tükenmiş limit başlığı veya login sayfasında ve ilk
-        yanıtta OLMAYAN hız sınırlama metni rate limiting sayılır. Genel 5xx, WAF/challenge
-        ve ağ hatası rate limiting DEĞİLDİR ve "rate limiting yok" iddiasına da dönüşmez.
+        kanıtlı 503, Retry-After / tükenmiş limit başlığı, kilit sayfasına yönlendirme veya
+        login sayfasında ve ilk yanıtta OLMAYAN hız sınırlama metni rate limiting sayılır.
+        Throttle, challenge, sunucu hatası veya yanıt yokluğu denemeleri (ve değerlendirmenin
+        sonraki tüm aktif gönderimlerini) DURDURUR; bu durumlar "rate limiting yok" iddiasına
+        dönüşmez.
         """
+        refusal = assessment.refusal(ActiveAuthTest.RATE_LIMIT_PROBE, url)
+        if refusal:
+            result.findings.append(self._not_executed(
+                "Rate-limit testi yürütülmedi", refusal, url,
+                f"{_RATE_LIMIT_ATTEMPTS} başarısız giriş denemesi"))
+            return
+
         counts = {kind: 0 for kind in AttemptKind}
         reference = [login_page_text]
-        blocked_reason = ""
+        sent = 0
 
-        for i in range(5):
+        for i in range(_RATE_LIMIT_ATTEMPTS):
             data = self._build_data(
                 form, user_field, pass_field,
                 f"wronguser_{i}_xyz", f"wrongpass_{i}_xyz",
             )
-            res = self._submit(session, url, method, data)
-            attempt = classify_attempt(res, tuple(reference))
+            res = self._submit(assessment, ActiveAuthTest.RATE_LIMIT_PROBE, session, url, method, data)
+            sent += 1
+            attempt = self._attempt_class(assessment, res, tuple(reference))
             counts[attempt.kind] += 1
+            assessment.record(attempt)
 
             if attempt.kind == AttemptKind.RATE_LIMITED:
                 if res.status_code in (429, 503):
@@ -337,48 +398,73 @@ class AuthScanner(Scanner):
                 result.findings.append(Finding(
                     severity=Severity.INFO,
                     title=title,
-                    evidence=f"{i + 1}. başarısız denemede: {attempt.reason}",
+                    evidence=outcome_evidence(
+                        AuthOutcome.CONTROL_RESPONSE_OBSERVED,
+                        f"{i + 1}. başarısız denemede: {attempt.reason} | sonraki aktif gönderimler durduruldu"),
                     confidence=confidence,
                     status=FindingStatus.SECURE,
                     affected_url=url,
                 ))
                 return
 
-            if attempt.kind == AttemptKind.BLOCKED and not blocked_reason:
-                blocked_reason = attempt.reason
+            if assessment.stopped:
+                break
             if attempt.kind == AttemptKind.NORMAL and len(reference) == 1:
                 reference.append(res.text)  # ilk olağan yanıt: statik metin referansı
 
-        summary = (f"5 başarısız deneme — olağan yanıt: {counts[AttemptKind.NORMAL]}, "
+        summary = (f"{sent}/{_RATE_LIMIT_ATTEMPTS} başarısız deneme gönderildi — "
+                   f"olağan yanıt: {counts[AttemptKind.NORMAL]}, "
                    f"engelleme/challenge: {counts[AttemptKind.BLOCKED]}, "
                    f"sunucu hatası: {counts[AttemptKind.SERVER_ERROR]}, "
                    f"yanıt yok: {counts[AttemptKind.NETWORK_FAILURE]}")
 
-        if counts[AttemptKind.BLOCKED]:
-            # WAF/challenge bir engelleme biçimidir ama rate limiting kanıtı değildir
+        if assessment.boundary_violation:
             result.findings.append(Finding(
                 severity=Severity.INFO,
-                title="Rate-limit testi sonuçsuz: WAF/challenge yanıtı",
-                evidence=f"{summary} | İlk engelleme: {blocked_reason}",
-                confidence=Confidence.MEDIUM,
+                title="Rate-limit testi durduruldu: yetkili origin dışına yönlendirme",
+                evidence=outcome_evidence(
+                    AuthOutcome.BLOCKED,
+                    f"{summary} | {assessment.stop.reason} | sonraki aktif gönderimler durduruldu"),
+                confidence=Confidence.HIGH,
                 status=FindingStatus.INFORMATIONAL,
-                description="Login attempts received a WAF/challenge or forbidden response. This indicates "
-                            "some request filtering, but it is not evidence of authentication rate limiting, "
-                            "and it prevented assessing whether rate limiting is absent.",
+                description="A login submission was redirected outside the authorized lab origin. The "
+                            "redirect was not followed (no request, body, cookie or URL state reached the "
+                            "destination) and all further active authentication submissions were stopped. "
+                            "Rate limiting was not assessed.",
                 affected_url=url,
             ))
             return
 
-        if counts[AttemptKind.NORMAL] == 0:
-            # Hiç olağan yanıt gözlemlenmedi (ağ/sunucu hatası) — "rate limit yok" iddia edilemez
+        if assessment.stopped and assessment.stop.kind == AttemptKind.BLOCKED:
+            # WAF/challenge bir engelleme biçimidir ama rate limiting kanıtı değildir
+            result.findings.append(Finding(
+                severity=Severity.INFO,
+                title="Rate-limit testi sonuçsuz: WAF/challenge yanıtı",
+                evidence=outcome_evidence(
+                    AuthOutcome.BLOCKED,
+                    f"{summary} | Engelleme: {assessment.stop.reason} | sonraki aktif gönderimler durduruldu"),
+                confidence=Confidence.MEDIUM,
+                status=FindingStatus.INFORMATIONAL,
+                description="Login attempts received a WAF/challenge or forbidden response, so all further "
+                            "active authentication submissions were stopped. This indicates some request "
+                            "filtering, but it is not evidence of authentication rate limiting, and it "
+                            "prevented assessing whether rate limiting is absent.",
+                affected_url=url,
+            ))
+            return
+
+        if assessment.stopped or counts[AttemptKind.NORMAL] == 0:
+            # Sunucu hatası / yanıt yok — "rate limit yok" iddia edilemez
             result.findings.append(Finding(
                 severity=Severity.INFO,
                 title="Rate-limit testi sonuçsuz",
-                evidence=summary,
+                evidence=outcome_evidence(
+                    AuthOutcome.INCOMPLETE, f"{summary} | sonraki aktif gönderimler durduruldu"),
                 confidence=Confidence.MEDIUM,
                 status=FindingStatus.INFORMATIONAL,
-                description="No normal login response was observed (network failures or transient server "
-                            "errors), so rate limiting could neither be confirmed nor ruled out.",
+                description="A server error or missing response stopped the test (and all further active "
+                            "authentication submissions), so rate limiting could neither be confirmed nor "
+                            "ruled out.",
                 affected_url=url,
             ))
             return
@@ -394,7 +480,9 @@ class AuthScanner(Scanner):
         result.findings.append(Finding(
             severity=Severity.MEDIUM,
             title="Potential Lack of Authentication Rate Limiting",
-            evidence=f"5 başarısız denemeden sonra engelleme veya yavaşlama tespit edilmedi | {summary}",
+            evidence=outcome_evidence(
+                AuthOutcome.AUTHENTICATION_NOT_ESTABLISHED,
+                f"5 başarısız denemeden sonra kontrol yanıtı (engelleme veya yavaşlama) gözlenmedi | {summary}"),
             confidence=Confidence.LOW,
             status=FindingStatus.MANUAL_REVIEW,
             description=description,
@@ -406,43 +494,65 @@ class AuthScanner(Scanner):
 
     # --- Varsayılan kimlik bilgileri ---
 
-    def _attempt_login(self, login_url: str, username: str, password: str):
+    def _attempt_login(self, assessment: ActiveAuthAssessment, login_url: str,
+                       username: str, password: str):
         """Tek bir giriş denemesi — YALITILMIŞ oturumla.
 
         Her senaryo (baseline ve her aday) yeni bir SafeSession ile login sayfasını yeniden
         alır: taze CSRF/hidden değerler, önceki denemelerden cookie/flash durumu yok.
-        Başarılı bir girişin oturumu başka hiçbir istekte kullanılmaz. Gönderilen giriş
-        denemesi sayısı değişmez (her senaryo bir gönderim).
-        Döner: (yanıt veya None, action_url veya None)
+        Başarılı bir girişin oturumu başka hiçbir istekte kullanılmaz. Gönderim hedefi
+        (taze form action) gönderimden önce yetki/durdurma kontrolünden geçer.
+        Döner: (yanıt veya None, action_url veya None, gönderilmediyse (AuthOutcome, neden))
         """
         session = self._make_session()
         page = self._get(session, login_url)
         if page is None:
-            return None, None
+            return None, None, None   # yanıt yok → NETWORK_FAILURE (durdurma koşulu)
         form, user_field, pass_field = self._find_login_form(BeautifulSoup(page.text, "html.parser"))
         if not form or not pass_field:
-            return None, None
+            return None, None, (AuthOutcome.INCOMPLETE, "login formu yeniden alınamadı")
         action_url = urljoin(login_url, form.get("action") or login_url)
+        refusal = assessment.refusal(ActiveAuthTest.DEFAULT_CREDENTIALS, action_url)
+        if refusal:
+            return None, action_url, (AuthOutcome.NOT_EXECUTED, refusal)
         method = form.get("method", "post").lower()
         data = self._build_data(form, user_field, pass_field, username, password)
-        return self._submit(session, action_url, method, data), action_url
+        res = self._submit(assessment, ActiveAuthTest.DEFAULT_CREDENTIALS, session, action_url, method, data)
+        return res, action_url, None
 
-    def _check_default_creds(self, login_url: str, action_url: str, user_field,
-                             login_page_text: str, result: ScanResult) -> None:
-        """Sabit, küçük varsayılan kimlik bilgisi listesini başarısız-giriş baseline'ına göre test eder.
+    def _check_default_creds(self, assessment: ActiveAuthAssessment, login_url: str, action_url: str,
+                             user_field, login_page_text: str, result: ScanResult) -> None:
+        """Sabit, küçük varsayılan kimlik bilgisi listesini başarısız-giriş baseline'ına göre test eder (AKTİF).
 
-        Liste genişletilmez; kimlik bilgisi türetme/uyarlama yoktur. Engelleme veya hız
-        sınırlaması görülürse denemeler DURUR (atlatma denenmez).
+        Liste genişletilmez; kimlik bilgisi türetme/uyarlama yoktur. Durdurma koşulu
+        (throttle, challenge, şüpheli kilit, sunucu hatası, yanıt yok) görülürse sonraki tüm
+        gönderimler DURUR (yeniden deneme, kimlik değiştirme, atlatma yok).
         """
+        total = len(_DEFAULT_CREDS)
+        refusal = assessment.refusal(ActiveAuthTest.DEFAULT_CREDENTIALS, action_url)
+        if refusal:
+            result.findings.append(self._not_executed(
+                "Varsayılan kimlik bilgisi testi yapılmadı", refusal, action_url,
+                f"başarısız-giriş baseline'ı ve {total} önceden tanımlı kimlik bilgisi"))
+            return
+
         base_user, base_pass = invalid_credentials()   # kalıcı değil, kanıta yazılmaz
-        baseline, base_action = self._attempt_login(login_url, base_user, base_pass)
-        base_class = classify_attempt(baseline, (login_page_text,))
-        if base_class.kind != AttemptKind.NORMAL:
-            # Baseline yoksa adaylar değerlendirilemez — varsayılan kimlik bilgisi kabul edilmez
+        baseline, base_action, problem = self._attempt_login(assessment, login_url, base_user, base_pass)
+        if problem is None:
+            base_class = self._attempt_class(assessment, baseline, (login_page_text,))
+            assessment.record(base_class)
+            if base_class.kind != AttemptKind.NORMAL:
+                problem = (outcome_for_stop(base_class.kind),
+                           f"{base_class.reason} | sonraki aktif gönderimler durduruldu")
+        if problem is not None:
+            # Baseline yoksa adaylar değerlendirilemez — varsayılan kimlik bilgisi gönderilmez
+            outcome, reason = problem
             result.findings.append(Finding(
                 severity=Severity.INFO,
                 title="Varsayılan kimlik bilgisi testi yapılmadı",
-                evidence=f"Başarısız-giriş baseline'ı kurulamadı: {base_class.reason or 'login iş akışı'}",
+                evidence=outcome_evidence(
+                    outcome, f"Başarısız-giriş baseline'ı kurulamadı: {reason} | "
+                             f"Gönderilmeyen: {total} önceden tanımlı kimlik bilgisi"),
                 confidence=Confidence.MEDIUM,
                 status=FindingStatus.INFORMATIONAL,
                 description="A known failed-login response could not be established, so default "
@@ -454,16 +564,20 @@ class AuthScanner(Scanner):
         baseline_desc = describe_response(baseline, action_url)
 
         best = None          # en güçlü onaylanmamış sonuç: (evidence, username, candidate_desc)
-        inconclusive = []
+        incomplete = None    # (AuthOutcome, neden)
+        attempted = 0
         for username, password in _DEFAULT_CREDS:
-            res, cand_action = self._attempt_login(login_url, username, password)
-            attempt = classify_attempt(res, (login_page_text, baseline.text))
-            if attempt.kind in (AttemptKind.RATE_LIMITED, AttemptKind.BLOCKED):
-                inconclusive.append(f"{username}: {attempt.reason} — denemeler durduruldu")
+            res, cand_action, problem = self._attempt_login(assessment, login_url, username, password)
+            if problem is not None:
+                incomplete = (problem[0], f"{username}: {problem[1]}")
                 break
+            attempted += 1
+            attempt = self._attempt_class(assessment, res, (login_page_text, baseline.text))
+            assessment.record(attempt)
             if attempt.kind != AttemptKind.NORMAL:
-                inconclusive.append(f"{username}: {attempt.reason}")
-                continue
+                incomplete = (outcome_for_stop(attempt.kind),
+                              f"{username}: {attempt.reason} — sonraki aktif gönderimler durduruldu")
+                break
             if res.status_code == 401:
                 continue  # açık kimlik doğrulama reddi
 
@@ -471,6 +585,7 @@ class AuthScanner(Scanner):
                                      baseline_username=base_user, candidate_username=username)
             candidate_desc = describe_response(res, cand_action or action_url)
             if evidence.confirmed:
+                # Kimliği doğrulanmış durum kuruldu — başka gönderim yapılmaz
                 self._add_default_cred_finding(result, action_url, user_field, username,
                                                baseline_desc, candidate_desc, evidence, confirmed=True)
                 return
@@ -483,27 +598,34 @@ class AuthScanner(Scanner):
             evidence, username, candidate_desc = best
             self._add_default_cred_finding(result, action_url, user_field, username,
                                            baseline_desc, candidate_desc, evidence, confirmed=False)
-            return
 
-        if inconclusive:
+        if incomplete is not None:
+            outcome, reason = incomplete
             result.findings.append(Finding(
                 severity=Severity.INFO,
                 title="Varsayılan kimlik bilgisi testi tamamlanamadı",
-                evidence=f"Baseline: {baseline_desc} | Sonuçsuz: {'; '.join(inconclusive)}",
+                evidence=outcome_evidence(
+                    outcome, f"{reason} | Denenen: {attempted}/{total} | Baseline: {baseline_desc}"),
                 confidence=Confidence.MEDIUM,
                 status=FindingStatus.INFORMATIONAL,
-                description="Some default-credential attempts could not be evaluated (rate limiting, "
-                            "blocking, server errors or network failures). No successful default "
-                            "credential was observed, but the test was not complete.",
+                description="The default-credential test stopped before completion (rate limiting, "
+                            "blocking, a server error, a network failure or a refused submission). "
+                            "Remaining credentials were not submitted. No authenticated state was "
+                            "established by the attempts that ran, but the test was not complete.",
                 affected_url=action_url,
             ))
+            return
+
+        if best is not None:
             return
 
         result.findings.append(Finding(
             severity=Severity.INFO,
             title="Varsayılan kimlik bilgileri geçersiz",
-            evidence=f"Test edilen {len(_DEFAULT_CREDS)} kombinasyon başarısız-giriş baseline'ı ile eşleşti "
-                     f"| Baseline: {baseline_desc}",
+            evidence=outcome_evidence(
+                AuthOutcome.AUTHENTICATION_NOT_ESTABLISHED,
+                f"Test edilen {total} kombinasyon başarısız-giriş baseline'ı ile eşleşti veya açıkça "
+                f"reddedildi | Baseline: {baseline_desc}"),
             confidence=Confidence.HIGH,
             status=FindingStatus.INFORMATIONAL,
             affected_url=action_url,
@@ -512,29 +634,39 @@ class AuthScanner(Scanner):
     def _add_default_cred_finding(self, result, action_url, user_field, username,
                                   baseline_desc, candidate_desc, evidence, confirmed: bool) -> None:
         signals = evidence.strong_signals + evidence.supporting_signals
+        if confirmed:
+            outcome = outcome_evidence(AuthOutcome.AUTHENTICATED_STATE_ESTABLISHED)
+        else:
+            outcome = outcome_evidence(AuthOutcome.AUTHENTICATION_NOT_ESTABLISHED,
+                                       "yanıt başarısız girişten farklı; kimliği doğrulanmış durum kanıtı yetersiz")
         # Parola değeri kanıt olarak sızdırılmaz — yalnızca hangi kullanıcı adının denendiği belirtilir
-        text = (f"Kullanıcı: {username} | Parola: [gizlendi — test edilen bilinen varsayılan değer] "
+        text = (f"{outcome} | Kullanıcı: {username} | Parola: [gizlendi — test edilen bilinen varsayılan değer] "
                 f"| Başarısız-giriş baseline'ı: {baseline_desc} | Aday: {candidate_desc} "
                 f"| Kimliği doğrulanmış durum sinyalleri: {', '.join(signals) or 'yok (yalnızca yanıt farkı)'}")
+        if evidence.negative_signals:
+            text += f" | Kimliği doğrulanmamış durum işaretleri: {', '.join(evidence.negative_signals)}"
         if confirmed:
             severity, title, confidence, status = (Severity.CRITICAL, "Varsayılan kimlik bilgileri geçerli",
                                                    Confidence.HIGH, FindingStatus.CONFIRMED)
             description = ("A well-known default credential combination was accepted: the response differs "
-                           "from a known failed-login response and shows independent authenticated-state "
-                           "signals (listed in the evidence).")
+                           "from a known failed-login response, a logout control appeared that the failed "
+                           "login does not show, and an independent transition signal was observed "
+                           "(listed in the evidence).")
         elif evidence.potential:
             severity, title, confidence, status = (Severity.HIGH, "Varsayılan kimlik bilgileri muhtemelen geçerli",
                                                    Confidence.MEDIUM, FindingStatus.POTENTIAL)
             description = ("The response to a default credential differs from a known failed-login response "
-                           "and shows one authenticated-state signal, which is not enough to confirm a "
-                           "successful login. Manual verification is required.")
+                           "and shows authenticated-state indications (e.g. a redirect and a missing login "
+                           "form), but no credible authenticated-state evidence such as a newly visible "
+                           "logout control. Manual verification is required.")
         else:
             severity, title, confidence, status = (Severity.MEDIUM,
                                                    "Varsayılan kimlik bilgisi yanıtı farklı — doğrulama gerekli",
                                                    Confidence.LOW, FindingStatus.MANUAL_REVIEW)
             description = ("The response to a default credential differs from a known failed-login response, "
-                           "but no authenticated-state evidence was observed (it may be a different error, "
-                           "an MFA step or a password-change prompt). Manual verification is required.")
+                           "but no authenticated-state evidence was observed, or the page looks like an "
+                           "error, maintenance, consent, challenge/MFA or password-change screen, or an "
+                           "unexpected redirect. Manual verification is required.")
         result.findings.append(Finding(
             severity=severity, title=title, evidence=text, confidence=confidence, status=status,
             description=description, affected_url=action_url, parameter=user_field, owasp=_OWASP_AUTH,
